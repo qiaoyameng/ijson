@@ -521,3 +521,5 @@ def enrich_backend(backend, **capabilities_overrides):
             backend[async_name] = factory(backend)
         factory = globals()['_make_' + name]
         backend[name] = factory(backend)
+    if globals().get('_sequence_backend_enricher') is not None:
+        globals()['_sequence_backend_enricher'](backend)

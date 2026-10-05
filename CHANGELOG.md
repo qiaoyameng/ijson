@@ -4,6 +4,9 @@
 
 * Removed support for Python < 3.10
 * Fixed treatment of null characters on strings (map keys and string values) on `cffi` backend (#178).
+* Added `ijson.json_sequence` and `ijson.json_sequence_async` for reading
+  RFC 7464 JSON Text Sequences, with optional skipping of invalid records
+  and per-record size limits.
 
 ## [3.5.1]
 

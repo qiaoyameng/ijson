@@ -116,6 +116,39 @@ In that case one can use the ``kvitems`` function instead:
         do_something_with(name)
 
 
+JSON Text Sequences
+~~~~~~~~~~~~~~~~~~~
+
+``ijson.json_sequence`` reads `RFC 7464 JSON Text Sequences
+<https://datatracker.ietf.org/doc/html/rfc7464>`_.
+Records are byte sequences beginning with an ``RS`` byte (``\\x1e``).
+Each record is parsed independently with the selected ijson backend,
+so one corrupt record does not prevent later records from being parsed.
+
+By default parsing stops at the first invalid record
+and raises ``InvalidRecordError``.
+Pass a callable as ``on_bad_record`` to report and skip invalid records,
+or use ``skip_bad_records=True`` to silently skip them.
+Error objects expose the 1-based ``record_number``,
+the half-open source byte range (``start`` and ``end``),
+and the parser's ``reason``.
+
+.. code-block:: python
+
+    def report(error):
+        print(error.record_number, error.start, error.end, error.reason)
+
+    with open('logs.json-seq', 'rb') as f:
+        for value in ijson.json_sequence(f, on_bad_record=report):
+            process(value)
+
+``json_sequence_async`` provides the same interface for async files
+and async byte iterables.
+The ``max_record_size`` option (64 MiB by default)
+limits how much record data is accumulated;
+exceeding it always raises ``RecordTooLargeError``.
+
+
 Lower-level interfaces
 ----------------------
 
