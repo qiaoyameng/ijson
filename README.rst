@@ -226,6 +226,45 @@ ijson provides a built-in adapter to bridge this gap:
 - ``ijson.from_iter(iterable_or_async_iterable_of_bytes)``
 
 
+JSON Text Sequences (RFC 7464)
+------------------------------
+
+Log files and other streams are often stored as `RFC 7464`_ JSON text
+sequences: a concatenation of independent records, each one starting with the
+ASCII record separator byte (``\\x1e``) and ending with a line feed
+(``\\n``). ``ijson.sequences.items`` reads such streams one record at a time,
+so a single broken record never makes the rest of the stream unreadable:
+
+.. code-block:: python
+
+   import ijson
+   from ijson import sequences
+
+   with open('log.jsonseq', 'rb') as f:
+       for record in sequences.items(f, on_bad_record=sequences.SKIP):
+           process(record)
+
+Records are delimited by the record separator byte, so newlines inside a
+record (inside strings or in pretty printed documents) and multi-byte UTF-8
+characters split across reads are handled correctly, and top level scalars
+such as numbers are properly terminated. Each record is parsed in isolation,
+so trailing garbage inside a record invalidates that record only.
+
+The ``on_bad_record`` parameter chooses what to do with invalid records:
+
+- ``'raise'`` (the default) raises ``ijson.sequences.InvalidRecordError``.
+- ``ijson.sequences.SKIP`` silently skips them.
+- a callable receives a ``BadRecord`` with the 1-based record number, its
+  ``[start, end)`` source byte range and the failure reason. Skipping resumes
+  at the next record separator, so no part of a broken record is ever read as
+  the next JSON text.
+
+``max_record_size`` rejects records larger than the given number of bytes;
+the limit is enforced before the rest of an oversized record is buffered.
+
+.. _RFC 7464: https://www.rfc-editor.org/rfc/rfc7464
+
+
 ``asyncio`` support
 -------------------
 
