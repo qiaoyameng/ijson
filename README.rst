@@ -458,6 +458,54 @@ the prefix works as the selection
 for which objects should be automatically built and returned by ijson.
 
 
+Typed paths
+===========
+
+Dotted prefixes are ambiguous for some documents:
+keys containing dots (``{"a.b": ...}``) are indistinguishable
+from nested objects, empty keys disappear from the prefix,
+and real keys named ``item`` clash with the array element marker.
+For those cases ijson offers a typed-path variant of the
+event and selection interfaces:
+
+- ``ijson.parse_path`` works like ``ijson.parse``,
+  but generates ``(path, event, value)`` tuples
+  where ``path`` is an immutable tuple of typed segments
+  instead of a dotted string.
+  Object member names are represented by string segments
+  and array positions by 0-based integer segments.
+  ``start_map``/``start_array`` and their matching end events
+  carry the path of the container itself,
+  while ``map_key`` events carry the path of the map they belong to
+  (the key itself is the event value).
+  Each event gets its own tuple,
+  so delivered events never change as parsing progresses.
+- ``ijson.items_path`` and ``ijson.kvitems_path`` work like
+  ``ijson.items`` and ``ijson.kvitems``,
+  but take a selector tuple instead of a prefix string.
+  Selector segments are strings (exact key match),
+  integers (exact array position)
+  or the ``ijson.ARRAY_WILDCARD`` singleton
+  (matches any array position,
+  playing the role of the ``item`` marker in prefixes).
+
+For example, given the document
+``{"a.b": [{"item": 1}, {"item": 2}]}``:
+
+.. code-block:: python
+
+    import ijson
+
+    # Yields 1 and 2
+    for item in ijson.items_path(source, ('a.b', ijson.ARRAY_WILDCARD, 'item')):
+        ...
+
+Like the rest of the API,
+these functions are available in generator (``*_gen``),
+coroutine (``*_coro``) and asynchronous (``*_async``) variants,
+all sharing the same semantics.
+
+
 Backends
 ========
 

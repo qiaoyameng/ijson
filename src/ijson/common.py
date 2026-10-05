@@ -23,6 +23,30 @@ class IncompleteJSONError(JSONError):
     pass
 
 
+class _ArrayWildcard:
+    '''
+    Type of the ``ARRAY_WILDCARD`` singleton, used as a selector segment
+    matching any array position in typed path selectors.
+    '''
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self):
+        return 'ARRAY_WILDCARD'
+
+
+ARRAY_WILDCARD = _ArrayWildcard()
+'''
+Selector segment matching any array position (integer path segment).
+Use it in typed path selectors passed to ``items_path``/``kvitems_path``
+where the dotted-prefix API would use the ``item`` marker.
+'''
+
+
 @utils.coroutine
 def parse_basecoro(target):
     '''
@@ -89,6 +113,93 @@ def parse_basecoro(target):
         else: # any scalar value
             prefix = '.'.join(path)
         target.send((prefix, event, value))
+
+
+@utils.coroutine
+def parse_path_basecoro(target):
+    '''
+    A coroutine dispatching parsing events with typed, unambiguous location
+    information. Events are tuples ``(path, event, value)`` where ``path``
+    is an immutable tuple of segments: strings for object member names and
+    integers for array positions (0-based). Unlike the dotted ``prefix``
+    produced by ``parse_basecoro``, keys containing dots, empty keys and
+    keys like ``item`` or numeric strings are represented faithfully, and
+    array positions are real indices instead of the ``item`` marker.
+
+    The path of ``start_map``/``start_array`` and their matching
+    ``end_map``/``end_array`` events points at the container itself.
+    ``map_key`` events carry the path of the map they belong to, with the
+    key itself delivered as the event value. Scalar events carry the full
+    path of the value.
+
+    Each event gets its own tuple, so delivered events never change when
+    the internal (mutable) position stack is reused for later events.
+
+    For example, given this document::
+
+        {
+          "array": [1, 2],
+          "map": {
+            "key": "value"
+          }
+        }
+
+    the parser would yield events:
+
+      ((), 'start_map', None)
+      ((), 'map_key', 'array')
+      (('array',), 'start_array', None)
+      (('array', 0), 'number', 1)
+      (('array', 1), 'number', 2)
+      (('array',), 'end_array', None)
+      ((), 'map_key', 'map')
+      (('map',), 'start_map', None)
+      (('map',), 'map_key', 'key')
+      (('map', 'key'), 'string', u'value')
+      (('map',), 'end_map', None)
+      ((), 'end_map', None)
+
+    '''
+    path = []
+    while True:
+        event, value = yield
+        if event == 'map_key':
+            current = tuple(path[:-1])
+            path[-1] = value
+        elif event == 'start_map':
+            current = tuple(path)
+            path.append(None)
+        elif event == 'start_array':
+            current = tuple(path)
+            path.append(0)
+        elif event == 'end_map' or event == 'end_array':
+            path.pop()
+            current = tuple(path)
+            if path and isinstance(path[-1], int):
+                path[-1] += 1
+        else: # any scalar value
+            current = tuple(path)
+            if path and isinstance(path[-1], int):
+                path[-1] += 1
+        target.send((current, event, value))
+
+
+def _path_matches(selector, path):
+    '''
+    Checks whether a typed event ``path`` (a tuple of str/int segments)
+    matches a ``selector`` tuple whose segments are strings (exact key
+    match), integers (exact array position) or ``ARRAY_WILDCARD``
+    (any array position).
+    '''
+    if len(selector) != len(path):
+        return False
+    for segment, current in zip(selector, path):
+        if segment is ARRAY_WILDCARD:
+            if not isinstance(current, int):
+                return False
+        elif segment != current:
+            return False
+    return True
 
 
 class ObjectBuilder:
@@ -199,6 +310,61 @@ def kvitems_basecoro(target, prefix, map_type=None):
             target.send((key, builder.value))
 
 
+@utils.coroutine
+def items_path_basecoro(target, path, map_type=None):
+    '''
+    A coroutine dispatching native Python objects constructed from the events
+    whose typed path matches the ``path`` selector: a tuple of string keys,
+    integer array positions and/or ``ARRAY_WILDCARD`` segments.
+    '''
+    selector = tuple(path)
+    while True:
+        current, event, value = (yield)
+        if _path_matches(selector, current):
+            if event in ('start_map', 'start_array'):
+                object_depth = 1
+                builder = ObjectBuilder(map_type=map_type)
+                while object_depth:
+                    builder.event(event, value)
+                    current, event, value = (yield)
+                    if event in ('start_map', 'start_array'):
+                        object_depth += 1
+                    elif event in ('end_map', 'end_array'):
+                        object_depth -= 1
+                target.send(builder.value)
+            else:
+                target.send(value)
+
+
+@utils.coroutine
+def kvitems_path_basecoro(target, path, map_type=None):
+    '''
+    A coroutine dispatching (key, value) pairs constructed from the events
+    under a typed path selector. The selector should point to JSON objects.
+    '''
+    selector = tuple(path)
+    builder = None
+    while True:
+        current, event, value = (yield)
+        while _path_matches(selector, current) and event == 'map_key':
+            object_depth = 0
+            key = value
+            builder = ObjectBuilder(map_type=map_type)
+            current, event, value = (yield)
+            if event == 'start_map':
+                object_depth += 1
+            while (
+                (event != 'map_key' or object_depth != 0) and
+                (event != 'end_map' or object_depth != -1)):
+                builder.event(event, value)
+                current, event, value = (yield)
+                if event == 'start_map':
+                    object_depth += 1
+                elif event == 'end_map':
+                    object_depth -= 1
+            target.send((key, builder.value))
+
+
 def integer_or_decimal(str_value):
     '''
     Converts string with a numeric value into an int or a Decimal.
@@ -260,6 +426,29 @@ def _kvitems_pipeline(backend, prefix, map_type, config):
     )
 
 
+def _parse_path_pipeline(backend, config):
+    return (
+        (backend['parse_path_basecoro'], [], {}),
+        (backend['basic_parse_basecoro'], [], config)
+    )
+
+
+def _items_path_pipeline(backend, path, map_type, config):
+    return (
+        (backend['items_path_basecoro'], (path,), {'map_type': map_type}),
+        (backend['parse_path_basecoro'], [], {}),
+        (backend['basic_parse_basecoro'], [], config)
+    )
+
+
+def _kvitems_path_pipeline(backend, path, map_type, config):
+    return (
+        (backend['kvitems_path_basecoro'], (path,), {'map_type': map_type}),
+        (backend['parse_path_basecoro'], [], {}),
+        (backend['basic_parse_basecoro'], [], config)
+    )
+
+
 def _make_basic_parse_coro(backend):
     def basic_parse_coro(target, **config):
         return utils.chain(
@@ -294,6 +483,33 @@ def _make_kvitems_coro(backend):
             *_kvitems_pipeline(backend, prefix, map_type, config)
         )
     return kvitems_coro
+
+
+def _make_parse_path_coro(backend):
+    def parse_path_coro(target, **config):
+        return utils.chain(
+            target,
+            *_parse_path_pipeline(backend, config)
+        )
+    return parse_path_coro
+
+
+def _make_items_path_coro(backend):
+    def items_path_coro(target, path, map_type=None, **config):
+        return utils.chain(
+            target,
+            *_items_path_pipeline(backend, path, map_type, config)
+        )
+    return items_path_coro
+
+
+def _make_kvitems_path_coro(backend):
+    def kvitems_path_coro(target, path, map_type=None, **config):
+        return utils.chain(
+            target,
+            *_kvitems_path_pipeline(backend, path, map_type, config)
+        )
+    return kvitems_path_coro
 
 
 def is_awaitablefunction(func):
@@ -364,6 +580,33 @@ def _make_kvitems_gen(backend):
             *_kvitems_pipeline(backend, prefix, map_type, config)
         )
     return kvitems_gen
+
+
+def _make_parse_path_gen(backend):
+    def parse_path_gen(file_obj, buf_size=64*1024, **config):
+        return utils.coros2gen(
+            file_source(file_obj, buf_size=buf_size),
+            *_parse_path_pipeline(backend, config)
+        )
+    return parse_path_gen
+
+
+def _make_items_path_gen(backend):
+    def items_path_gen(file_obj, path, map_type=None, buf_size=64*1024, **config):
+        return utils.coros2gen(
+            file_source(file_obj, buf_size=buf_size),
+            *_items_path_pipeline(backend, path, map_type, config)
+        )
+    return items_path_gen
+
+
+def _make_kvitems_path_gen(backend):
+    def kvitems_path_gen(file_obj, path, map_type=None, buf_size=64*1024, **config):
+        return utils.coros2gen(
+            file_source(file_obj, buf_size=buf_size),
+            *_kvitems_path_pipeline(backend, path, map_type, config)
+        )
+    return kvitems_path_gen
 
 
 def _make_basic_parse(backend):
@@ -438,6 +681,63 @@ def _make_kvitems(backend):
     return kvitems
 
 
+def _make_parse_path(backend):
+    def parse_path(source, buf_size=64*1024, **config):
+        source = _get_source(source)
+        if is_async_file(source):
+            return backend['parse_path_async'](
+                source, buf_size=buf_size, **config
+            )
+        elif is_file(source):
+            return backend['parse_path_gen'](
+                source, buf_size=buf_size, **config
+            )
+        elif is_iterable(source):
+            return utils.coros2gen(source,
+                (backend['parse_path_basecoro'], (), {})
+            )
+        raise ValueError("Unknown source type: %r" % type(source))
+    return parse_path
+
+
+def _make_items_path(backend):
+    def items_path(source, path, map_type=None, buf_size=64*1024, **config):
+        source = _get_source(source)
+        if is_async_file(source):
+            return backend['items_path_async'](
+                source, path, map_type=map_type, buf_size=buf_size, **config
+            )
+        elif is_file(source):
+            return backend['items_path_gen'](
+                source, path, map_type=map_type, buf_size=buf_size, **config
+            )
+        elif is_iterable(source):
+            return utils.coros2gen(source,
+                (backend['items_path_basecoro'], (path,), {'map_type': map_type})
+            )
+        raise ValueError("Unknown source type: %r" % type(source))
+    return items_path
+
+
+def _make_kvitems_path(backend):
+    def kvitems_path(source, path, map_type=None, buf_size=64*1024, **config):
+        source = _get_source(source)
+        if is_async_file(source):
+            return backend['kvitems_path_async'](
+                source, path, map_type=map_type, buf_size=buf_size, **config
+            )
+        elif is_file(source):
+            return backend['kvitems_path_gen'](
+                source, path, map_type=map_type, buf_size=buf_size, **config
+            )
+        elif is_iterable(source):
+            return utils.coros2gen(source,
+                (backend['kvitems_path_basecoro'], (path,), {'map_type': map_type})
+            )
+        raise ValueError("Unknown source type: %r" % type(source))
+    return kvitems_path
+
+
 _common_functions_warn = '''
 Don't use the ijson.common.* functions; instead go directly with the ijson.* ones.
 See the documentation for more information.
@@ -503,7 +803,10 @@ def enrich_backend(backend, **capabilities_overrides):
     backend['capabilities'] = capabilities
     backend['backend'] = backend['__name__'].split('.')[-1]
     backend['backend_name'] = backend['backend']
-    for name in ('basic_parse', 'parse', 'items', 'kvitems'):
+    for name in (
+        'basic_parse', 'parse', 'items', 'kvitems',
+        'parse_path', 'items_path', 'kvitems_path',
+    ):
         basecoro_name = name + '_basecoro'
         if basecoro_name not in backend:
             backend[basecoro_name] = globals()[basecoro_name]

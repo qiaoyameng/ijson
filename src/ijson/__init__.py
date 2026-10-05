@@ -14,7 +14,12 @@ also two other backends using the C library yajl in ``ijson.backends`` that have
 the same API and are faster under CPython.
 '''
 from ijson.adapters import from_iter
-from ijson.common import JSONError, IncompleteJSONError, ObjectBuilder
+from ijson.common import (
+    ARRAY_WILDCARD,
+    JSONError,
+    IncompleteJSONError,
+    ObjectBuilder,
+)
 
 from ijson.utils import coroutine, sendable_list
 from .version import __version__
@@ -52,9 +57,18 @@ items = backend.items
 items_coro = backend.items_coro
 kvitems = backend.kvitems
 kvitems_coro = backend.kvitems_coro
+parse_path = backend.parse_path
+parse_path_coro = backend.parse_path_coro
+items_path = backend.items_path
+items_path_coro = backend.items_path_coro
+kvitems_path = backend.kvitems_path
+kvitems_path_coro = backend.kvitems_path_coro
 basic_parse_async = backend.basic_parse_async
 parse_async = backend.parse_async
 items_async = backend.items_async
 kvitems_async = backend.kvitems_async
+parse_path_async = backend.parse_path_async
+items_path_async = backend.items_path_async
+kvitems_path_async = backend.kvitems_path_async
 backend_name = backend.backend_name
 backend = backend.backend

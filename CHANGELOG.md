@@ -4,6 +4,14 @@
 
 * Removed support for Python < 3.10
 * Fixed treatment of null characters on strings (map keys and string values) on `cffi` backend (#178).
+* Added typed path events and selectors: `ijson.parse_path` generates
+  `(path, event, value)` events whose path is an immutable tuple of string
+  keys and integer array positions, unambiguously representing empty keys,
+  dotted keys, `item` keys and numeric string keys. `ijson.items_path` and
+  `ijson.kvitems_path` select objects using those path segments together
+  with the explicit `ijson.ARRAY_WILDCARD` array wildcard. Generator,
+  coroutine and async variants are included; the dotted-prefix API is
+  unchanged.
 
 ## [3.5.1]
 
