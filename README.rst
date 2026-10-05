@@ -226,6 +226,47 @@ ijson provides a built-in adapter to bridge this gap:
 - ``ijson.from_iter(iterable_or_async_iterable_of_bytes)``
 
 
+Filtering items
+---------------
+
+When the objects of a JSON array are large
+and only some of them are needed --
+for instance when acceptance depends on a ``status`` field
+appearing at the very end of each object --
+``ijson.filtered_items`` yields only the objects
+satisfying a set of declarative field conditions:
+
+.. code-block:: python
+
+   import ijson
+
+   condition = ijson.FieldCondition('status', 'eq', 'accepted')
+   for obj in ijson.filtered_items(source, 'item', condition):
+       do_something_with(obj)
+
+Conditions are restricted to scalar comparisons
+(``eq``, ``ne``, ``lt``, ``le``, ``gt``, ``ge``, ``in``)
+against configured fields;
+no arbitrary expression code is evaluated.
+While the filter cannot be decided yet,
+the events needed to reconstruct the current object
+are kept in a bounded buffer
+(``max_buffered_events``)
+that spills to a temporary file
+under the caller-provided ``temp_dir`` directory,
+so rejected objects never fully reside in memory.
+Repeated condition fields are handled
+according to the explicit ``on_duplicate`` policy
+(``'last'`` by default,
+so a later ``rejected`` value overrides an earlier ``accepted`` one;
+``'first'`` allows failing objects to be discarded earlier).
+Temporary files are always closed and removed,
+even if the consumer stops early
+or the source stream is corrupted.
+Asynchronous sources are not supported
+by this function.
+
+
 ``asyncio`` support
 -------------------
 

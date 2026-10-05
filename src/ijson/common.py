@@ -521,3 +521,6 @@ def enrich_backend(backend, **capabilities_overrides):
             backend[async_name] = factory(backend)
         factory = globals()['_make_' + name]
         backend[name] = factory(backend)
+    if 'filtered_items' not in backend:
+        from ijson.filtering import _make_filtered_items
+        backend['filtered_items'] = _make_filtered_items(backend)
