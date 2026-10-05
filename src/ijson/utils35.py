@@ -77,12 +77,26 @@ def _make_parse_async(backend):
         )
     return parse_async
 
+def _make_parse_typed_async(backend):
+    def parse_typed_async(f, buf_size=64*1024, **config):
+        return async_iterable(f, buf_size,
+            *common._parse_typed_pipeline(backend, config)
+        )
+    return parse_typed_async
+
 def _make_items_async(backend):
     def items_async(f, prefix, map_type=None, buf_size=64*1024, **config):
         return async_iterable(f, buf_size,
             *common._items_pipeline(backend, prefix, map_type, config)
         )
     return items_async
+
+def _make_items_at_path_async(backend):
+    def items_at_path_async(f, path, map_type=None, buf_size=64*1024, **config):
+        return async_iterable(f, buf_size,
+            *common._items_at_path_pipeline(backend, path, map_type, config)
+        )
+    return items_at_path_async
 
 def _make_kvitems_async(backend):
     def kvitems_async(f, prefix, map_type=None, buf_size=64*1024, **config):

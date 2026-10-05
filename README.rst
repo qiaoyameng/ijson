@@ -458,6 +458,55 @@ the prefix works as the selection
 for which objects should be automatically built and returned by ijson.
 
 
+Typed paths
+===========
+
+Dotted prefixes are ambiguous:
+an object key containing a dot (e.g. ``{"a.b": 1}``)
+is indistinguishable from actual nesting,
+and a member literally named ``item``
+clashes with the array element marker.
+The ``ijson.parse_typed`` function solves this
+by reporting locations as *typed paths*:
+tuples of segments where object member names are strings
+and array positions are integers.
+Each event carries its own immutable tuple,
+so events delivered earlier never change
+as parsing progresses.
+
+.. code-block:: python
+
+    import ijson
+
+    f = urlopen('http://.../')
+    for path, event, value in ijson.parse_typed(f):
+        if path == ('earth', 'europe', 0, 'name'):
+            ...
+
+Paths point to the location of the event itself:
+``start_map``/``start_array`` and ``end_map``/``end_array`` events
+carry the path of the container being opened or closed,
+``map_key`` events carry the path of the member they announce
+(the enclosing object's path plus the key itself),
+and scalar values carry their own path.
+
+The companion ``ijson.items_at_path`` function
+selects objects located at a typed path,
+using the ``ijson.ANY_INDEX`` sentinel
+as an explicit wildcard matching any array position:
+
+.. code-block:: python
+
+    import ijson
+
+    f = urlopen('http://.../')
+    objects = ijson.items_at_path(f, ('earth', 'europe', ijson.ANY_INDEX))
+
+Both functions are also available
+in their ``_coro`` and ``_async`` variants,
+with the same semantics as the rest of the API.
+
+
 Backends
 ========
 

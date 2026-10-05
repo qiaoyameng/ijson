@@ -91,6 +91,150 @@ def parse_basecoro(target):
         target.send((prefix, event, value))
 
 
+class _AnyIndex:
+    '''
+    Type of the ``ANY_INDEX`` sentinel.
+    '''
+    __slots__ = ()
+
+    def __repr__(self):
+        return 'ANY_INDEX'
+
+
+ANY_INDEX = _AnyIndex()
+'''
+Wildcard segment for typed paths matching any array index.
+
+Use it in the paths given to ``items_at_path`` (and its variants) to select
+the elements of an array regardless of their position, e.g.
+``items_at_path(source, ('docs', ANY_INDEX, 'meta'))``.
+'''
+
+
+@utils.coroutine
+def parse_typed_basecoro(target):
+    '''
+    A coroutine dispatching parsing events with typed information about their
+    location within the JSON object tree. Events are tuples
+    ``(path, type, value)`` with the same types and values as
+    ``parse_basecoro``.
+
+    Unlike the dotted prefixes used by ``parse_basecoro``, paths are tuples of
+    segments where object member names are strings and array positions are
+    integers. This makes paths unambiguous even when object keys contain dots,
+    are empty, or collide with the ``item`` marker used by the prefix-based
+    API. Each event carries its own immutable tuple, so events delivered
+    earlier are never affected by later parsing progress.
+
+    Paths point to the location of the event itself:
+
+    - ``start_map``/``start_array`` and ``end_map``/``end_array`` events carry
+      the path of the container being opened or closed.
+    - ``map_key`` events carry the path of the member they announce, i.e. the
+      path of the enclosing object plus the key itself.
+    - Scalar values carry their own path.
+
+    For example, given this document::
+
+        {
+          "array": [1, 2],
+          "map": {
+            "key": "value"
+          }
+        }
+
+    the parser would yield events:
+
+      ((), 'start_map', None)
+      (('array',), 'map_key', 'array')
+      (('array',), 'start_array', None)
+      (('array', 0), 'number', 1)
+      (('array', 1), 'number', 2)
+      (('array',), 'end_array', None)
+      (('map',), 'map_key', 'map')
+      (('map',), 'start_map', None)
+      (('map', 'key'), 'map_key', 'key')
+      (('map', 'key'), 'string', u'value')
+      (('map',), 'end_map', None)
+      ((), 'end_map', None)
+
+    '''
+    path = []
+    containers = []
+    indices = []
+    while True:
+        event, value = yield
+        if containers and containers[-1] == 'array' and event != 'end_array':
+            # A new element of the innermost array starts here
+            path[-1] = indices[-1]
+            indices[-1] += 1
+        if event == 'map_key':
+            path[-1] = value
+        elif event == 'start_map' or event == 'start_array':
+            target.send((tuple(path), event, value))
+            path.append(None)
+            containers.append('array' if event == 'start_array' else 'map')
+            if event == 'start_array':
+                indices.append(0)
+            continue
+        elif event == 'end_map' or event == 'end_array':
+            container = containers.pop()
+            path.pop()
+            if container == 'array':
+                indices.pop()
+        target.send((tuple(path), event, value))
+
+
+def _typed_path_matches(path, current):
+    if len(path) != len(current):
+        return False
+    for segment, actual in zip(path, current):
+        if segment is ANY_INDEX:
+            if not isinstance(actual, int):
+                return False
+        elif segment != actual:
+            return False
+    return True
+
+
+@utils.coroutine
+def items_at_path_basecoro(target, path, map_type=None):
+    '''
+    A coroutine dispatching native Python objects constructed from the events
+    located at a given typed path, as produced by ``parse_typed_basecoro``.
+
+    ``path`` is a sequence of segments: strings for object member names and
+    integers for array positions. The ``ANY_INDEX`` sentinel can be used as a
+    segment to match any array position.
+    '''
+    if isinstance(path, (str, bytes)):
+        raise TypeError(
+            'path must be a sequence of segments, not a string; '
+            'use ijson.items for prefix-based selection'
+        )
+    path = tuple(path)
+    while True:
+        current, event, value = (yield)
+        if event == 'map_key':
+            # map_key events share the path of the value they announce;
+            # they are not values themselves
+            continue
+        if _typed_path_matches(path, current):
+            if event in ('start_map', 'start_array'):
+                object_depth = 1
+                builder = ObjectBuilder(map_type=map_type)
+                while object_depth:
+                    builder.event(event, value)
+                    current, event, value = (yield)
+                    if event in ('start_map', 'start_array'):
+                        object_depth += 1
+                    elif event in ('end_map', 'end_array'):
+                        object_depth -= 1
+                target.send(builder.value)
+            else:
+                target.send(value)
+
+
 class ObjectBuilder:
     '''
     Incrementally builds an object from JSON parser events. Events are passed
@@ -244,10 +388,25 @@ def _parse_pipeline(backend, config):
     )
 
 
+def _parse_typed_pipeline(backend, config):
+    return (
+        (backend['parse_typed_basecoro'], [], {}),
+        (backend['basic_parse_basecoro'], [], config)
+    )
+
+
 def _items_pipeline(backend, prefix, map_type, config):
     return (
         (backend['items_basecoro'], (prefix,), {'map_type': map_type}),
         (backend['parse_basecoro'], [], {}),
+        (backend['basic_parse_basecoro'], [], config)
+    )
+
+
+def _items_at_path_pipeline(backend, path, map_type, config):
+    return (
+        (backend['items_at_path_basecoro'], (path,), {'map_type': map_type}),
+        (backend['parse_typed_basecoro'], [], {}),
         (backend['basic_parse_basecoro'], [], config)
     )
 
@@ -278,6 +437,15 @@ def _make_parse_coro(backend):
     return parse_coro
 
 
+def _make_parse_typed_coro(backend):
+    def parse_typed_coro(target, **config):
+        return utils.chain(
+            target,
+            *_parse_typed_pipeline(backend, config)
+        )
+    return parse_typed_coro
+
+
 def _make_items_coro(backend):
     def items_coro(target, prefix, map_type=None, **config):
         return utils.chain(
@@ -285,6 +453,15 @@ def _make_items_coro(backend):
             *_items_pipeline(backend, prefix, map_type, config)
         )
     return items_coro
+
+
+def _make_items_at_path_coro(backend):
+    def items_at_path_coro(target, path, map_type=None, **config):
+        return utils.chain(
+            target,
+            *_items_at_path_pipeline(backend, path, map_type, config)
+        )
+    return items_at_path_coro
 
 
 def _make_kvitems_coro(backend):
@@ -348,6 +525,15 @@ def _make_parse_gen(backend):
     return parse_gen
 
 
+def _make_parse_typed_gen(backend):
+    def parse_typed_gen(file_obj, buf_size=64*1024, **config):
+        return utils.coros2gen(
+            file_source(file_obj, buf_size=buf_size),
+            *_parse_typed_pipeline(backend, config)
+        )
+    return parse_typed_gen
+
+
 def _make_items_gen(backend):
     def items_gen(file_obj, prefix, map_type=None, buf_size=64*1024, **config):
         return utils.coros2gen(
@@ -355,6 +541,15 @@ def _make_items_gen(backend):
             *_items_pipeline(backend, prefix, map_type, config)
         )
     return items_gen
+
+
+def _make_items_at_path_gen(backend):
+    def items_at_path_gen(file_obj, path, map_type=None, buf_size=64*1024, **config):
+        return utils.coros2gen(
+            file_source(file_obj, buf_size=buf_size),
+            *_items_at_path_pipeline(backend, path, map_type, config)
+        )
+    return items_at_path_gen
 
 
 def _make_kvitems_gen(backend):
@@ -400,6 +595,25 @@ def _make_parse(backend):
     return parse
 
 
+def _make_parse_typed(backend):
+    def parse_typed(source, buf_size=64*1024, **config):
+        source = _get_source(source)
+        if is_async_file(source):
+            return backend['parse_typed_async'](
+                source, buf_size=buf_size, **config
+            )
+        elif is_file(source):
+            return backend['parse_typed_gen'](
+                source, buf_size=buf_size, **config
+            )
+        elif is_iterable(source):
+            return utils.coros2gen(source,
+                (backend['parse_typed_basecoro'], (), {})
+            )
+        raise ValueError("Unknown source type: %r" % type(source))
+    return parse_typed
+
+
 def _make_items(backend):
     def items(source, prefix, map_type=None, buf_size=64*1024, **config):
         source = _get_source(source)
@@ -417,6 +631,25 @@ def _make_items(backend):
             )
         raise ValueError("Unknown source type: %r" % type(source))
     return items
+
+
+def _make_items_at_path(backend):
+    def items_at_path(source, path, map_type=None, buf_size=64*1024, **config):
+        source = _get_source(source)
+        if is_async_file(source):
+            return backend['items_at_path_async'](
+                source, path, map_type=map_type, buf_size=buf_size, **config
+            )
+        elif is_file(source):
+            return backend['items_at_path_gen'](
+                source, path, map_type=map_type, buf_size=buf_size, **config
+            )
+        elif is_iterable(source):
+            return utils.coros2gen(source,
+                (backend['items_at_path_basecoro'], (path,), {'map_type': map_type})
+            )
+        raise ValueError("Unknown source type: %r" % type(source))
+    return items_at_path
 
 
 def _make_kvitems(backend):
@@ -503,7 +736,10 @@ def enrich_backend(backend, **capabilities_overrides):
     backend['capabilities'] = capabilities
     backend['backend'] = backend['__name__'].split('.')[-1]
     backend['backend_name'] = backend['backend']
-    for name in ('basic_parse', 'parse', 'items', 'kvitems'):
+    for name in (
+        'basic_parse', 'parse', 'items', 'kvitems',
+        'parse_typed', 'items_at_path',
+    ):
         basecoro_name = name + '_basecoro'
         if basecoro_name not in backend:
             backend[basecoro_name] = globals()[basecoro_name]

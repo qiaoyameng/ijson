@@ -4,6 +4,13 @@
 
 * Removed support for Python < 3.10
 * Fixed treatment of null characters on strings (map keys and string values) on `cffi` backend (#178).
+* Added typed path events via the new `ijson.parse_typed` function, which
+  reports event locations as tuples of segments (strings for object member
+  names, integers for array positions) instead of ambiguous dotted prefixes.
+  Added the companion `ijson.items_at_path` selector accepting these path
+  segments plus the explicit `ijson.ANY_INDEX` array wildcard. Both are
+  available in synchronous, coroutine and asyncio variants; the prefix-based
+  API is unchanged.
 
 ## [3.5.1]
 
