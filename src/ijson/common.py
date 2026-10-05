@@ -2,8 +2,12 @@
 Backend independent higher level interfaces, common exceptions.
 '''
 import decimal
+import enum
 import inspect
 import io
+import os
+import pickle
+import tempfile
 import warnings
 
 from ijson import compat, utils, utils35
@@ -147,6 +151,180 @@ class ObjectBuilder:
             self._add(value)
 
 
+class DuplicateFieldPolicy(str, enum.Enum):
+    FIRST = 'first'
+    LAST = 'last'
+    ERROR = 'error'
+
+
+def _validate_filters(filters):
+    if not isinstance(filters, dict):
+        raise TypeError('filters must be a dict')
+    for field, expected in filters.items():
+        if not isinstance(field, str):
+            raise TypeError('filter fields must be strings')
+        if isinstance(expected, (dict, list, tuple, set)):
+            raise TypeError('filter values must be scalar')
+        if not isinstance(expected, (str, bool, int, float, decimal.Decimal)) and expected is not None:
+            raise TypeError('filter values must be scalar')
+
+
+class EventSpool:
+    def __init__(self, max_size, temp_dir=None):
+        if max_size <= 0:
+            raise ValueError('max_buffer_size must be positive')
+        self.max_size = max_size
+        self.temp_dir = temp_dir
+        self.size = 0
+        self.events = []
+        self.file = None
+        self.dump = None
+
+    def add(self, event):
+        payload = pickle.dumps(event, protocol=pickle.HIGHEST_PROTOCOL)
+        self.size += len(payload)
+        if self.file is None and self.size > self.max_size:
+            if self.temp_dir is None:
+                raise BufferError('object buffer is full and no temp_dir was provided')
+            self.file = tempfile.TemporaryFile(
+                mode='w+b',
+                dir=self.temp_dir,
+                prefix='ijson-',
+                suffix='.events',
+            )
+            self.dump = pickle.Pickler(self.file, protocol=pickle.HIGHEST_PROTOCOL)
+            for buffered_event in self.events:
+                self.dump.dump(buffered_event)
+            self.events = []
+        if self.file is not None:
+            self.dump.dump(event)
+            return True
+        self.events.append(event)
+        return False
+
+    def replay(self, builder):
+        if self.file is None:
+            for prefix, event, value in self.events:
+                builder.event(event, value)
+            return
+        self.file.seek(0)
+        unpickler = pickle.Unpickler(self.file)
+        while self.file.tell() < self.size:
+            prefix, event, value = unpickler.load()
+            builder.event(event, value)
+
+    def close(self):
+        if self.file is not None:
+            file = self.file
+            self.file = None
+            self.dump = None
+            self.events = []
+            file.close()
+
+
+class _ObjectFilter:
+    def __init__(self, target, prefix, filters, duplicate_field_policy,
+                 max_buffer_size, temp_dir, map_type):
+        _validate_filters(filters)
+        self.target = target
+        self.prefix = prefix
+        self.filters = filters
+        self.duplicate_field_policy = self._policy(duplicate_field_policy)
+        self.max_buffer_size = max_buffer_size
+        self.temp_dir = temp_dir
+        self.map_type = map_type
+        self.active = False
+        self.depth = 0
+        self.spool = None
+        self.current_key = None
+        self.values = {}
+        self.seen = set()
+
+    @staticmethod
+    def _policy(policy):
+        if isinstance(policy, DuplicateFieldPolicy):
+            return policy
+        try:
+            return DuplicateFieldPolicy(policy)
+        except ValueError:
+            raise ValueError('invalid duplicate field policy: %r' % (policy,))
+
+    def start(self, event, value):
+        self.active = True
+        self.depth = 1
+        self.spool = EventSpool(self.max_buffer_size, self.temp_dir)
+        self.current_key = None
+        self.values = {}
+        self.seen = set()
+        self.spool.add((self.prefix, event, value))
+
+    def event(self, prefix, event, value):
+        if not self.active:
+            if prefix == self.prefix and event == 'start_map':
+                if self.filters:
+                    self.start(event, value)
+                    return True
+                return False
+            if prefix == self.prefix and event == 'start_array':
+                return False
+            if prefix == self.prefix:
+                if self.filters:
+                    return True
+                self.target.send(value)
+                return True
+            return False
+
+        self.spool.add((prefix, event, value))
+
+        if event == 'start_map' or event == 'start_array':
+            self.depth += 1
+            if self.depth == 2 and self.current_key in self.filters:
+                self._record(self.current_key, None, False)
+            return True
+
+        if event == 'map_key' and self.depth == 1:
+            self.current_key = value
+            return True
+
+        is_scalar = event not in ('end_map', 'end_array')
+        if is_scalar and self.depth == 1 and self.current_key in self.filters:
+            self._record(self.current_key, value, True)
+
+        if event == 'end_map' or event == 'end_array':
+            self.depth -= 1
+
+        if self.depth == 0:
+            accepted = all(
+                key in self.seen and self.values[key][1] and self.values[key][0] == expected
+                for key, expected in self.filters.items()
+            )
+            spool = self.spool
+            self.active = False
+            self.spool = None
+            try:
+                if accepted:
+                    builder = ObjectBuilder(map_type=self.map_type)
+                    spool.replay(builder)
+                    self.target.send(builder.value)
+            finally:
+                spool.close()
+        return True
+
+    def _record(self, key, value, scalar):
+        if key in self.seen:
+            if self.duplicate_field_policy == DuplicateFieldPolicy.FIRST:
+                return
+            if self.duplicate_field_policy == DuplicateFieldPolicy.ERROR:
+                raise ValueError('duplicate filter field: %s' % key)
+        self.seen.add(key)
+        self.values[key] = (value, scalar)
+
+    def close(self):
+        if self.spool is not None:
+            self.spool.close()
+            self.spool = None
+
+
 @utils.coroutine
 def items_basecoro(target, prefix, map_type=None):
     '''
@@ -169,6 +347,35 @@ def items_basecoro(target, prefix, map_type=None):
                 target.send(builder.value)
             else:
                 target.send(value)
+
+
+@utils.coroutine
+def filtered_items_basecoro(target, prefix, filters, duplicate_field_policy='last',
+                            max_buffer_size=64*1024, temp_dir=None, map_type=None):
+    object_filter = _ObjectFilter(
+        target, prefix, filters, duplicate_field_policy,
+        max_buffer_size, temp_dir, map_type,
+    )
+    try:
+        while True:
+            current, event, value = (yield)
+            if object_filter.event(current, event, value):
+                continue
+            if current == object_filter.prefix and event in ('start_map', 'start_array'):
+                object_depth = 1
+                builder = ObjectBuilder(map_type=map_type)
+                while object_depth:
+                    builder.event(event, value)
+                    current, event, value = (yield)
+                    if event in ('start_map', 'start_array'):
+                        object_depth += 1
+                    elif event in ('end_map', 'end_array'):
+                        object_depth -= 1
+                target.send(builder.value)
+            elif current == object_filter.prefix:
+                target.send(value)
+    finally:
+        object_filter.close()
 
 
 @utils.coroutine
@@ -260,6 +467,23 @@ def _kvitems_pipeline(backend, prefix, map_type, config):
     )
 
 
+def _filtered_items_pipeline(backend, prefix, filters, duplicate_field_policy,
+                             max_buffer_size, temp_dir, map_type, config):
+    return (
+        (
+            backend['filtered_items_basecoro'],
+            (prefix, filters, duplicate_field_policy),
+            {
+                'max_buffer_size': max_buffer_size,
+                'temp_dir': temp_dir,
+                'map_type': map_type,
+            },
+        ),
+        (backend['parse_basecoro'], [], {}),
+        (backend['basic_parse_basecoro'], [], config)
+    )
+
+
 def _make_basic_parse_coro(backend):
     def basic_parse_coro(target, **config):
         return utils.chain(
@@ -294,6 +518,21 @@ def _make_kvitems_coro(backend):
             *_kvitems_pipeline(backend, prefix, map_type, config)
         )
     return kvitems_coro
+
+
+def _make_filtered_items_coro(backend):
+    def filtered_items_coro(target, prefix, filters, duplicate_field_policy='last',
+                            map_type=None, max_buffer_size=64*1024,
+                            temp_dir=None, **config):
+        coroutine = utils.chain(
+            target,
+            *_filtered_items_pipeline(
+                backend, prefix, filters, duplicate_field_policy,
+                max_buffer_size, temp_dir, map_type, config
+            )
+        )
+        return utils.closing_coroutine(coroutine)
+    return filtered_items_coro
 
 
 def is_awaitablefunction(func):
@@ -364,6 +603,20 @@ def _make_kvitems_gen(backend):
             *_kvitems_pipeline(backend, prefix, map_type, config)
         )
     return kvitems_gen
+
+
+def _make_filtered_items_gen(backend):
+    def filtered_items_gen(file_obj, prefix, filters, duplicate_field_policy='last',
+                           map_type=None, buf_size=64*1024,
+                           max_buffer_size=64*1024, temp_dir=None, **config):
+        return utils.coros2gen(
+            file_source(file_obj, buf_size=buf_size),
+            *_filtered_items_pipeline(
+                backend, prefix, filters, duplicate_field_policy,
+                max_buffer_size, temp_dir, map_type, config
+            )
+        )
+    return filtered_items_gen
 
 
 def _make_basic_parse(backend):
@@ -438,6 +691,42 @@ def _make_kvitems(backend):
     return kvitems
 
 
+def _make_filtered_items(backend):
+    def filtered_items(source, prefix, filters, duplicate_field_policy='last',
+                       map_type=None, buf_size=64*1024,
+                       max_buffer_size=64*1024, temp_dir=None, **config):
+        source = _get_source(source)
+        if is_async_file(source):
+            return backend['filtered_items_async'](
+                source, prefix, filters,
+                duplicate_field_policy=duplicate_field_policy,
+                map_type=map_type, buf_size=buf_size,
+                max_buffer_size=max_buffer_size, temp_dir=temp_dir, **config
+            )
+        if is_file(source):
+            return backend['filtered_items_gen'](
+                source, prefix, filters,
+                duplicate_field_policy=duplicate_field_policy,
+                map_type=map_type, buf_size=buf_size,
+                max_buffer_size=max_buffer_size, temp_dir=temp_dir, **config
+            )
+        if is_iterable(source):
+            return utils.coros2gen(
+                source,
+                (
+                    backend['filtered_items_basecoro'],
+                    (prefix, filters, duplicate_field_policy),
+                    {
+                        'map_type': map_type,
+                        'max_buffer_size': max_buffer_size,
+                        'temp_dir': temp_dir,
+                    },
+                )
+            )
+        raise ValueError("Unknown source type: %r" % type(source))
+    return filtered_items
+
+
 _common_functions_warn = '''
 Don't use the ijson.common.* functions; instead go directly with the ijson.* ones.
 See the documentation for more information.
@@ -503,7 +792,7 @@ def enrich_backend(backend, **capabilities_overrides):
     backend['capabilities'] = capabilities
     backend['backend'] = backend['__name__'].split('.')[-1]
     backend['backend_name'] = backend['backend']
-    for name in ('basic_parse', 'parse', 'items', 'kvitems'):
+    for name in ('basic_parse', 'parse', 'items', 'kvitems', 'filtered_items'):
         basecoro_name = name + '_basecoro'
         if basecoro_name not in backend:
             backend[basecoro_name] = globals()[basecoro_name]

@@ -30,6 +30,27 @@ def chain(sink, *coro_pipeline):
     return f
 
 
+class closing_coroutine:
+    def __init__(self, coroutine):
+        self.coroutine = coroutine
+
+    def send(self, value):
+        try:
+            return self.coroutine.send(value)
+        except BaseException:
+            self.coroutine.close()
+            raise
+
+    def throw(self, *args):
+        try:
+            return self.coroutine.throw(*args)
+        finally:
+            self.coroutine.close()
+
+    def close(self):
+        return self.coroutine.close()
+
+
 class sendable_list(list):
     '''
     A list that mimics a coroutine receiving values.
@@ -63,7 +84,7 @@ def coros2gen(source, *coro_pipeline):
                 yield event
             del events[:]
     except GeneratorExit:
-        try:
-            f.close()
-        except:
-            pass
+        f.close()
+    except BaseException:
+        f.close()
+        raise

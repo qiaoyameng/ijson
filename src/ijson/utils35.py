@@ -39,6 +39,13 @@ class async_iterable:
         self.f = f
         self.buf_size = buf_size
         self.read = None
+        self.closed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        await self.aclose()
 
     def __aiter__(self):
         return self
@@ -61,6 +68,15 @@ class async_iterable:
                 if self.events:
                     return self.events.popleft()
                 raise StopAsyncIteration
+            except BaseException:
+                await self.aclose()
+                raise
+
+    async def aclose(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.coro.close()
 
 
 def _make_basic_parse_async(backend):
@@ -90,3 +106,16 @@ def _make_kvitems_async(backend):
             *common._kvitems_pipeline(backend, prefix, map_type, config)
         )
     return kvitems_async
+
+
+def _make_filtered_items_async(backend):
+    def filtered_items_async(f, prefix, filters, duplicate_field_policy='last',
+                             map_type=None, buf_size=64*1024,
+                             max_buffer_size=64*1024, temp_dir=None, **config):
+        return async_iterable(f, buf_size,
+            *common._filtered_items_pipeline(
+                backend, prefix, filters, duplicate_field_policy,
+                max_buffer_size, temp_dir, map_type, config
+            )
+        )
+    return filtered_items_async
