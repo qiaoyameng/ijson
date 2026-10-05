@@ -15,6 +15,14 @@ the same API and are faster under CPython.
 '''
 from ijson.adapters import from_iter
 from ijson.common import JSONError, IncompleteJSONError, ObjectBuilder
+from ijson.validation import (
+    EventValidator,
+    UnsupportedSchemaError,
+    ValidationBudgetExceeded,
+    ValidationError,
+    validate_events,
+    validator_basecoro,
+)
 
 from ijson.utils import coroutine, sendable_list
 from .version import __version__
