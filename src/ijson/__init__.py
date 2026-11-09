@@ -50,6 +50,7 @@ parse = backend.parse
 parse_coro = backend.parse_coro
 items = backend.items
 items_coro = backend.items_coro
+items_session = backend.items_session
 kvitems = backend.kvitems
 kvitems_coro = backend.kvitems_coro
 basic_parse_async = backend.basic_parse_async

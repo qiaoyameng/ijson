@@ -496,6 +496,7 @@ def enrich_backend(backend, **capabilities_overrides):
     Provides a backend with any missing coroutines/generators/async-iterables
     it might be missing by using the generic ones written in python.
     '''
+    from ijson.sessions import _make_items_session
     # Backends unset some of these
     capabilities = BackendCapabilities()
     for name, value in capabilities_overrides.items():
@@ -521,3 +522,5 @@ def enrich_backend(backend, **capabilities_overrides):
             backend[async_name] = factory(backend)
         factory = globals()['_make_' + name]
         backend[name] = factory(backend)
+    if 'items_session' not in backend:
+        backend['items_session'] = _make_items_session(backend)

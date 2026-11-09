@@ -256,6 +256,63 @@ this was the only way to access
 the ``asyncio`` support.
 
 
+Items sessions
+--------------
+
+``ijson.items`` returns a plain generator,
+which makes the lifecycle of a single import
+(normal completion, early cancellation or an error)
+hard to manage uniformly across synchronous and asynchronous code.
+The ``ijson.items_session`` function opens an explicit-lifecycle
+session around one import instead.
+It reuses the exact same parsing and object building pipeline
+as ``ijson.items``,
+but gives the import a clear beginning and end:
+
+.. code-block:: python
+
+    import ijson
+
+    with ijson.items_session(f, 'earth.europe.item') as session:
+        for city in session:
+            do_something_with(city)
+
+An asynchronous file-like object returns an asynchronous session
+that is used with ``async with`` and ``async for``:
+
+.. code-block:: python
+
+    async with ijson.items_session(f, 'earth.europe.item') as session:
+        async for city in session:
+            do_something_with(city)
+
+The three ways a session can finish are kept separate:
+
+* Reaching the real end of the input completes normally,
+  while truncated JSON still raises ``IncompleteJSONError``.
+* Leaving the session early
+  (a ``break`` or an explicit ``close()``/``aclose()``)
+  only abandons the remaining parsing;
+  it is never reported as corrupt input and never drains
+  the source to its end.
+* If the source, the parser or the consumer code raises,
+  the original exception is preserved:
+  failures while cleaning up the internal pipeline cannot mask it.
+
+Closing is idempotent.
+Once closed a session yields no further objects
+(not even ones already produced and cached)
+and never reads from the source again;
+the internal parsing coroutines and their buffers
+are released immediately,
+without any background thread.
+The source remains owned by the caller by default.
+Passing ``close_source=True`` transfers that responsibility
+to the session,
+which then calls the source's ``close()`` (synchronous sessions)
+or ``aclose()`` (asynchronous sessions, falling back to ``close()``).
+
+
 Intercepting events
 -------------------
 

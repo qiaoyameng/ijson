@@ -2,6 +2,18 @@
 
 ## Development
 
+* Added `ijson.items_session`, an explicit-lifecycle session around a single
+  `items` import. A synchronous source yields a context-managed
+  `ItemsSession` (`with`/`for`, plus `close()` and `aclose()`), while an
+  asynchronous source yields an `AsyncItemsSession` (`async with`/`async for`,
+  plus `aclose()` and `close()`). Real EOF still validates the document
+  (truncated JSON raises `IncompleteJSONError`), consumer-driven early exits
+  simply abandon the remaining parsing, and original exceptions always win
+  over cleanup failures. Closing is idempotent, releases the internal parsing
+  pipeline deterministically without background threads, never reads the
+  source again, and only closes the source itself when `close_source=True` is
+  given. The existing `items`/`items_async` functions and their defaults are
+  unchanged.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).
