@@ -58,3 +58,13 @@ items_async = backend.items_async
 kvitems_async = backend.kvitems_async
 backend_name = backend.backend_name
 backend = backend.backend
+
+# Segmented string events are only implemented by the pure python backend
+from ijson.backends.python import (  # noqa: E402
+    basic_parse_segmented,
+    basic_parse_segmented_async,
+    basic_parse_segmented_coro,
+    basic_parse_segmented_gen,
+)
+from ijson.common import segmented_to_events  # noqa: E402
+from ijson.utils35 import asegmented_to_events  # noqa: E402

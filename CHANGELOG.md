@@ -2,6 +2,14 @@
 
 ## Development
 
+* The `python` backend now provides a segmented string events interface
+  (`ijson.basic_parse_segmented`, also available as `_gen`/`_async`/`_coro`
+  variants): string values are reported as `start_string`/`string_chunk`/
+  `end_string` event sequences, with a configurable maximum chunk size
+  (`string_chunk_size`) and an optional map key length limit
+  (`map_key_max_length`). The new `ijson.segmented_to_events` and
+  `ijson.asegmented_to_events` adapters convert segmented events back into
+  the traditional event stream.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).

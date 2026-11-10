@@ -21,6 +21,30 @@ async def _get_read(f):
         return f.read
     return compat._warn_and_return(utf8reader_async(f).read)
 
+
+async def asegmented_to_events(events):
+    """
+    Async version of ijson.common.segmented_to_events: converts an async
+    iterable of segmented events back into the traditional event stream.
+    """
+    async for event, value in events:
+        if event == 'start_string':
+            chunks = []
+            async for event, value in events:
+                if event == 'string_chunk':
+                    chunks.append(value)
+                elif event == 'end_string':
+                    break
+                else:
+                    raise common.JSONError('Unexpected event %r inside a string' % (event,))
+            else:
+                raise common.JSONError('String was not properly terminated')
+            yield ('string', ''.join(chunks))
+        elif event in ('string_chunk', 'end_string'):
+            raise common.JSONError('Unexpected event %r outside a string' % (event,))
+        else:
+            yield (event, value)
+
 class sendable_deque(collections.deque):
     '''Like utils.sendable_list, but for deque objects'''
     send = collections.deque.append
