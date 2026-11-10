@@ -116,6 +116,43 @@ In that case one can use the ``kvitems`` function instead:
         do_something_with(name)
 
 
+Multiple subscriptions
+----------------------
+
+Sometimes several parts of the same response are needed, for example both
+``records.item`` and each record's ``attachments.item``. Calling ``items``
+twice would read and parse the whole stream twice. The ``multi_items``
+function instead takes several ``(name, path)`` subscription rules, reads the
+underlying stream exactly once, and yields ``SubscriptionItem`` objects tagged
+with the subscription name they matched:
+
+.. code-block::  python
+
+    import ijson
+
+    rules = [
+        ("records", "records.item"),
+        ("attachments", "records.item.attachments.item"),
+    ]
+    for item in ijson.multi_items(f, rules):
+        print(item.name, item.value)
+
+Paths use object keys, array indices (integers) and the explicit ``item``
+array wildcard. A path given as a string is split on dots; use a tuple to
+address keys that themselves contain dots, e.g. ``("a.b", "x.y")``.
+Subscription names must be unique; duplicate names are rejected before any
+data is read.
+
+When a parent and a child rule both match, each constructs its own object and
+the child is emitted first as it closes earlier; rules matching the same
+location are emitted in declaration order. An object already delivered is
+never mutated again, and subscriptions never share their constructed state.
+Like the other interfaces ``multi_items`` is available as a synchronous
+iterator (``multi_items``), a push coroutine (``multi_items_coro``) and an
+asynchronous iterator (``multi_items_async``); cancelling any of them
+releases the objects still under construction.
+
+
 Lower-level interfaces
 ----------------------
 

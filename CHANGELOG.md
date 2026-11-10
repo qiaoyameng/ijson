@@ -2,6 +2,13 @@
 
 ## Development
 
+* Added `multi_items`, `multi_items_coro` and `multi_items_async`, which take
+  several `(name, path)` subscription rules and stream `SubscriptionItem`
+  objects from a single underlying read. Paths support object keys, integer
+  array indices and the explicit `item` wildcard; tuple paths preserve dotted
+  keys. Duplicate subscription names are rejected before reading, parent/child
+  and same-position matches are emitted in closing/declaration order, and
+  cancelling the iteration releases the objects still under construction.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).

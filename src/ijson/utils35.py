@@ -43,6 +43,22 @@ class async_iterable:
     def __aiter__(self):
         return self
 
+    async def aclose(self):
+        '''
+        Closes the underlying coroutine pipeline, which releases any state
+        (e.g. objects still under construction) held by its coroutines.
+        Parsing errors raised while shutting down an incomplete stream are
+        suppressed: cancellation means the remaining input is irrelevant.
+        '''
+        self.events.clear()
+        close = getattr(self.coro, 'close', None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
+        self.coro_finished = True
+
     async def __anext__(self):
         if not self.read:
             self.read = await _get_read(self.f)
@@ -90,3 +106,11 @@ def _make_kvitems_async(backend):
             *common._kvitems_pipeline(backend, prefix, map_type, config)
         )
     return kvitems_async
+
+
+def _make_multi_items_async(backend):
+    def multi_items_async(f, rules, map_type=None, buf_size=64*1024, **config):
+        return async_iterable(f, buf_size,
+            *common._multi_items_pipeline(backend, rules, map_type, config)
+        )
+    return multi_items_async
