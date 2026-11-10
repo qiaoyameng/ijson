@@ -373,8 +373,9 @@ like this:
 Options
 =======
 
-Additional options are supported by **all** ijson functions
-to give users more fine-grained control over certain operations:
+Additional options are supported by ijson functions
+to give users more fine-grained control over certain operations.
+Unless otherwise noted they are supported by **all** backends:
 
 - The ``use_float`` option (defaults to ``False``)
   controls how non-integer values are returned to the user.
@@ -393,6 +394,41 @@ to give users more fine-grained control over certain operations:
   Future versions of ijson
   might change the default value of this option
   to ``True``.
+- The ``number_factory`` option (defaults to ``None``,
+  currently supported only by the ``python`` backend)
+  accepts a callable that fully controls how JSON numbers are converted.
+  It is invoked once per number, and only after the number has been read
+  completely and validated as syntactically legal JSON, with two arguments:
+  the structural ``path`` to the number as an immutable tuple of object keys
+  (``str``) and array indices (``int``), and the original JSON number text
+  (``str``), preserving its exact integer, fraction and exponent spelling.
+  Whatever the callable returns is used as the number value, so different
+  locations in the document can produce different types, e.g. ``Decimal``
+  for monetary amounts, strict ``int`` for counters and ``float`` for
+  individual sensor readings::
+
+      from decimal import Decimal
+
+      def factory(path, raw):
+          if path and path[0] == 'amount':
+              return Decimal(raw)
+          if path and path[0] == 'count':
+              if '.' in raw or 'e' in raw or 'E' in raw:
+                  raise TypeError('counts must be integers')
+              return int(raw)
+          return float(raw) if ('.' in raw or 'e' in raw or 'E' in raw) else int(raw)
+
+      for prefix, event, value in ijson.parse(f, number_factory=factory):
+          ...
+
+  ``true``, ``false`` and ``null`` never reach the factory.
+  If the callable raises, ijson wraps the exception in a
+  ``NumberFactoryError`` (not a JSON syntax error) that carries the
+  offending ``path`` and ``number``, while preserving the original
+  exception as its cause. ``number_factory`` is mutually exclusive with
+  ``use_float``: passing both raises ``ValueError``. When omitted the
+  default ``int``/``Decimal`` (or ``int``/``float`` with ``use_float``)
+  behavior is unchanged.
 - The ``multiple_values`` option (defaults to ``False``)
   controls whether multiple top-level values are supported.
   JSON content should contain a single top-level value
@@ -524,6 +560,8 @@ It contains the following members:
   raising an ``IncompleteJSONError``.
 * ``int64``: when using ``use_float=True``,
     values greater than or equal to ``2^32`` are correctly returned.
+* ``number_factory``: custom per-number conversion is supported through the
+    ``number_factory`` option.
 
 These capabilities are supported by all backends,
 with the following exceptions:
@@ -534,6 +572,7 @@ with the following exceptions:
   in platforms with a 32-bit C ``long`` type.
 
 * The ``python`` backend doesn't support ``c_comments``.
+* Only the ``python`` backend supports ``number_factory``.
 
 
 Performance tips

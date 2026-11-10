@@ -23,6 +23,29 @@ class IncompleteJSONError(JSONError):
     pass
 
 
+class NumberFactoryError(Exception):
+    '''
+    Raised when a user-provided ``number_factory`` callable raises while
+    converting a JSON number.
+
+    This is deliberately *not* a :class:`JSONError`: the offending number was
+    already fully read and validated as syntactically legal JSON, so the
+    failure belongs to the user's conversion logic rather than to the JSON
+    grammar. The original exception is preserved as the cause (accessible via
+    ``__cause__``), together with the structural ``path`` at which the number
+    was found and its original textual ``number`` representation.
+    '''
+
+    def __init__(self, path, number, original):
+        self.path = path
+        self.number = number
+        self.original = original
+        super(NumberFactoryError, self).__init__(
+            'number_factory failed at path %r on number %r: %s'
+            % (path, number, original)
+        )
+
+
 @utils.coroutine
 def parse_basecoro(target):
     '''
@@ -481,6 +504,7 @@ class BackendCapabilities:
         'invalid_leading_zeros_detection': 'Detection of leading zeros in numbers, marking them as invalid',
         'incomplete_json_tokens_detection': 'Documents with incomplete JSON tokens',
         'int64': '64 bit integers supported when running with ``use_float=True``',
+        'number_factory': 'Custom per-number conversion via a user-provided ``number_factory`` callable',
     }
 
     def __init__(self):
@@ -489,6 +513,7 @@ class BackendCapabilities:
         self.invalid_leading_zeros_detection = True
         self.incomplete_json_tokens_detection = True
         self.int64 = True
+        self.number_factory = False
 
 
 def enrich_backend(backend, **capabilities_overrides):

@@ -2,6 +2,17 @@
 
 ## Development
 
+* The `python` backend gains a `number_factory` option. When given a
+  callable, each syntactically valid JSON number is handed to it together
+  with its structural path (an immutable tuple of object keys and array
+  indices) and its original textual representation, and whatever the
+  callable returns is used as the number value. The factory is called
+  exactly once per number, never for `true`/`false`/`null`, and is
+  mutually exclusive with `use_float`. Exceptions raised by the factory
+  are wrapped in a new `NumberFactoryError` carrying the path and the
+  original number while preserving the exception chain, instead of being
+  reported as JSON syntax errors. A new `number_factory` backend
+  capability advertises support; other backends remain unchanged.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).

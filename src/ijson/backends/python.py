@@ -10,6 +10,7 @@ import codecs
 
 LEXEME_RE = re.compile(r'[a-z0-9eE\.\+-]+|\S')
 INTEGER_RE = re.compile(r'-?[0-9]+')
+NUMBER_RE = re.compile(r'-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
 UNARY_LEXEMES = set('[]{},')
 EOF = -1, None
 
@@ -140,11 +141,16 @@ inf = float("inf")
 neg_inf = float("-inf")
 
 @utils.coroutine
-def parse_value(target, multivalue, use_float):
+def parse_value(target, multivalue, use_float, number_factory):
     """
     Parses results coming out of the Lexer into ijson events, which are sent to
     `target`. A stack keeps track of the type of object being parsed at the time
     (a value, and object or array -- the last two being values themselves).
+
+    `path` mirrors the structural location of the value currently being
+    parsed as a list of object keys (str) and array indices (int). A copy is
+    frozen into a tuple and handed to `number_factory` together with the
+    original textual representation of every JSON number.
 
     A special EOF result coming from the Lexer indicates that no more content is
     expected. This is used to check for incomplete content and raise the
@@ -160,6 +166,8 @@ def parse_value(target, multivalue, use_float):
     send = target.send
     prev_pos, prev_symbol = None, None
     to_number = common.integer_or_float if use_float else common.integer_or_decimal
+    path = []
+    array_indices = []
     while True:
 
         if prev_pos is None:
@@ -206,6 +214,8 @@ def parse_value(target, multivalue, use_float):
                     pop()
                 else:
                     prev_pos, prev_symbol = pos, symbol
+                    array_indices.append(0)
+                    path.append(0)
                     push(_PARSE_ARRAY_ELEMENT_END)
                     push(_PARSE_VALUE)
             # Object start
@@ -219,6 +229,7 @@ def parse_value(target, multivalue, use_float):
                     pop()
                 else:
                     prev_pos, prev_symbol = pos, symbol
+                    path.append(None)
                     push(_PARSE_OBJECT_KEY)
             # A number
             else:
@@ -233,27 +244,51 @@ def parse_value(target, multivalue, use_float):
                 dot = symbol.find('.')
                 if dot != -1 and not (symbol[dot - 1:dot].isdigit() and symbol[dot + 1:dot + 2].isdigit()):
                     raise common.JSONError('Invalid JSON number: %s' % (symbol,))
-                try:
-                    number = to_number(symbol)
-                    if number == inf or number == neg_inf:
-                        raise common.JSONError("float overflow: %s" % (symbol,))
-                except:
-                    if 'true'.startswith(symbol) or 'false'.startswith(symbol) or 'null'.startswith(symbol):
-                        raise common.IncompleteJSONError('Incomplete JSON content')
-                    # a well-formed integer that int() still refused is one
-                    # longer than sys.get_int_max_str_digits(); let that
-                    # error through as the other backends do
-                    if INTEGER_RE.fullmatch(symbol):
+                if number_factory is not None:
+                    # The factory is only consulted once the lexeme is a
+                    # complete, syntactically valid JSON number, so dangling
+                    # tokens such as "1e" never reach it.
+                    if NUMBER_RE.fullmatch(symbol) is None:
+                        if ('true'.startswith(symbol) or
+                                'false'.startswith(symbol) or
+                                'null'.startswith(symbol)):
+                            raise common.IncompleteJSONError('Incomplete JSON content')
+                        raise UnexpectedSymbol(symbol, pos)
+                    number_path = tuple(path)
+                    try:
+                        number = number_factory(number_path, symbol)
+                    except common.NumberFactoryError:
                         raise
-                    raise UnexpectedSymbol(symbol, pos)
-                else:
+                    except Exception as exception:
+                        raise common.NumberFactoryError(
+                            number_path, symbol, exception
+                        ) from exception
                     send(('number', number))
                     pop()
+                else:
+                    try:
+                        number = to_number(symbol)
+                        if number == inf or number == neg_inf:
+                            raise common.JSONError("float overflow: %s" % (symbol,))
+                    except:
+                        if 'true'.startswith(symbol) or 'false'.startswith(symbol) or 'null'.startswith(symbol):
+                            raise common.IncompleteJSONError('Incomplete JSON content')
+                        # a well-formed integer that int() still refused is one
+                        # longer than sys.get_int_max_str_digits(); let that
+                        # error through as the other backends do
+                        if INTEGER_RE.fullmatch(symbol):
+                            raise
+                        raise UnexpectedSymbol(symbol, pos)
+                    else:
+                        send(('number', number))
+                        pop()
 
         elif state == _PARSE_OBJECT_KEY:
             if symbol[0] != '"':
                 raise UnexpectedSymbol(symbol, pos)
-            send(('map_key', parse_string(symbol)))
+            key = parse_string(symbol)
+            path[-1] = key
+            send(('map_key', key))
             pos, symbol = (yield)
             if (pos, symbol) == EOF:
                 raise common.IncompleteJSONError('Incomplete JSON content')
@@ -269,17 +304,22 @@ def parse_value(target, multivalue, use_float):
                 raise UnexpectedSymbol(symbol, pos)
             else:
                 send(('end_map', None))
+                path.pop()
                 pop()
                 pop()
 
         elif state == _PARSE_ARRAY_ELEMENT_END:
             if symbol == ',':
                 state_stack[-1] = _PARSE_ARRAY_ELEMENT_END
+                array_indices[-1] += 1
+                path[-1] = array_indices[-1]
                 push(_PARSE_VALUE)
             elif symbol != ']':
                 raise UnexpectedSymbol(symbol, pos)
             else:
                 send(('end_array', None))
+                path.pop()
+                array_indices.pop()
                 pop()
                 pop()
 
@@ -289,17 +329,30 @@ def parse_string(symbol):
 
 
 def basic_parse_basecoro(target, multiple_values=False, allow_comments=False,
-                         use_float=False):
+                         use_float=False, number_factory=None):
     '''
     Iterator yielding unprefixed events.
 
     Parameters:
 
     - file: a readable file-like object with JSON input
+    - number_factory: optional callable taking the structural path (a tuple of
+      object keys and array indices) and the original JSON number text, and
+      returning the Python object to use for that number. Mutually exclusive
+      with use_float.
     '''
     if allow_comments:
         raise ValueError("Comments are not supported by the python backend")
-    return utf8_encoder(Lexer(parse_value(target, multiple_values, use_float)))
+    if number_factory is not None:
+        if use_float:
+            raise ValueError(
+                "number_factory and use_float are mutually exclusive"
+            )
+        if not callable(number_factory):
+            raise ValueError("number_factory must be callable")
+    return utf8_encoder(
+        Lexer(parse_value(target, multiple_values, use_float, number_factory))
+    )
 
 
-common.enrich_backend(globals(), c_comments=False)
+common.enrich_backend(globals(), c_comments=False, number_factory=True)
