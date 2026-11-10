@@ -407,6 +407,40 @@ to give users more fine-grained control over certain operations:
   controls whether C-style comments (e.g., ``/* a comment */``),
   which are not supported by the JSON standard,
   are allowed in the content or not.
+- The ``duplicate_keys`` option (defaults to ``'allow'``)
+  controls how duplicated keys within a single JSON object are handled.
+  Four policies are available:
+
+  - ``'allow'`` reports duplicates as-is;
+    when objects are constructed the last value wins,
+    matching the historical behavior.
+  - ``'error'`` raises an ``ijson.DuplicateKeyError``
+    as soon as a key is seen for the second time
+    within the same object.
+    The error message includes the key
+    and its position in the input.
+  - ``'first'`` keeps the first value of a duplicated key
+    when objects are constructed.
+  - ``'last'`` keeps the last value of a duplicated key
+    when objects are constructed.
+
+  Keys are compared after string decoding,
+  so differently-escaped spellings of the same key
+  (e.g., ``"a"`` and ``"\u0061"``) count as duplicates.
+  Each object is checked independently,
+  including nested and consecutive top-level objects.
+  The ``'first'`` and ``'last'`` policies only make sense
+  when objects are constructed,
+  so they are accepted by ``items`` and ``kvitems`` only;
+  ``parse`` and ``basic_parse`` reject them with a ``ValueError``
+  before any input is read,
+  since their event streams always report every key.
+  While duplicates are tracked,
+  each object level keeps a set of its keys
+  whose size is limited by the ``duplicate_keys_budget`` option
+  (defaults to 100000);
+  exceeding the budget raises an ``ijson.JSONError``
+  instead of silently stopping the bookkeeping.
 - For functions taking a file-like object,
   an additional ``buf_size`` option (defaults to ``65536`` or 64KB)
   specifies the amount of bytes the library
@@ -524,6 +558,7 @@ It contains the following members:
   raising an ``IncompleteJSONError``.
 * ``int64``: when using ``use_float=True``,
     values greater than or equal to ``2^32`` are correctly returned.
+* ``duplicate_keys``: the ``duplicate_keys`` option is supported.
 
 These capabilities are supported by all backends,
 with the following exceptions:
@@ -534,6 +569,8 @@ with the following exceptions:
   in platforms with a 32-bit C ``long`` type.
 
 * The ``python`` backend doesn't support ``c_comments``.
+
+* Only the ``python`` backend supports ``duplicate_keys``.
 
 
 Performance tips

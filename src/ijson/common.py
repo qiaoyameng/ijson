@@ -23,6 +23,26 @@ class IncompleteJSONError(JSONError):
     pass
 
 
+#: Policies accepted by the ``duplicate_keys`` option
+DUPLICATE_KEYS_POLICIES = ('allow', 'error', 'first', 'last')
+
+#: Policies that only make sense when objects are being constructed;
+#: the event-oriented ``parse``/``basic_parse`` functions reject them
+OBJECT_ONLY_DUPLICATE_KEYS_POLICIES = ('first', 'last')
+
+#: Default budget of distinct keys tracked per JSON object
+#: while the ``duplicate_keys`` option is actively enforced
+DEFAULT_DUPLICATE_KEYS_BUDGET = 100000
+
+
+class DuplicateKeyError(JSONError):
+    '''
+    Raised when a JSON object contains a duplicated key
+    and the ``duplicate_keys`` option is set to ``'error'``.
+    '''
+    pass
+
+
 @utils.coroutine
 def parse_basecoro(target):
     '''
@@ -98,6 +118,11 @@ class ObjectBuilder:
     value. The object being built is available at any time from the `value`
     attribute.
 
+    The ``duplicate_keys`` parameter controls how duplicated keys within a
+    single JSON object are treated: ``'allow'`` and ``'last'`` keep the last
+    value, ``'first'`` keeps the first one, and ``'error'`` raises a
+    ``DuplicateKeyError`` when the second occurrence of the key is seen.
+
     Example::
 
         >>> from io import BytesIO
@@ -112,10 +137,16 @@ class ObjectBuilder:
         True
 
     '''
-    def __init__(self, map_type=None):
+    def __init__(self, map_type=None, duplicate_keys='allow'):
+        if duplicate_keys not in DUPLICATE_KEYS_POLICIES:
+            raise ValueError(
+                "Invalid duplicate_keys policy %r; expected one of %r"
+                % (duplicate_keys, DUPLICATE_KEYS_POLICIES)
+            )
         self.value = None
         self.containers = []
         self.map_type = map_type or dict
+        self.duplicate_keys = duplicate_keys
 
     def _add(self, value):
         # Storing the in-progress containers themselves (rather than setter
@@ -127,12 +158,19 @@ class ObjectBuilder:
             top = self.containers[-1]
             if isinstance(top, list):
                 top.append(value)
+            elif self.duplicate_keys == 'first':
+                if self.key not in top:
+                    top[self.key] = value
             else:
                 top[self.key] = value
 
     def event(self, event, value):
         if event == 'map_key':
             self.key = value
+            if (self.duplicate_keys == 'error' and self.containers
+                    and not isinstance(self.containers[-1], list)
+                    and value in self.containers[-1]):
+                raise DuplicateKeyError('Duplicate key %r' % (value,))
         elif event == 'start_map':
             mappable = self.map_type()
             self._add(mappable)
@@ -148,7 +186,7 @@ class ObjectBuilder:
 
 
 @utils.coroutine
-def items_basecoro(target, prefix, map_type=None):
+def items_basecoro(target, prefix, map_type=None, duplicate_keys='allow'):
     '''
     An couroutine dispatching native Python objects constructed from the events
     under a given prefix.
@@ -158,7 +196,7 @@ def items_basecoro(target, prefix, map_type=None):
         if current == prefix:
             if event in ('start_map', 'start_array'):
                 object_depth = 1
-                builder = ObjectBuilder(map_type=map_type)
+                builder = ObjectBuilder(map_type=map_type, duplicate_keys=duplicate_keys)
                 while object_depth:
                     builder.event(event, value)
                     current, event, value = (yield)
@@ -172,7 +210,7 @@ def items_basecoro(target, prefix, map_type=None):
 
 
 @utils.coroutine
-def kvitems_basecoro(target, prefix, map_type=None):
+def kvitems_basecoro(target, prefix, map_type=None, duplicate_keys='allow'):
     '''
     An coroutine dispatching (key, value) pairs constructed from the events
     under a given prefix. The prefix should point to JSON objects
@@ -183,7 +221,7 @@ def kvitems_basecoro(target, prefix, map_type=None):
         while path == prefix and event == 'map_key':
             object_depth = 0
             key = value
-            builder = ObjectBuilder(map_type=map_type)
+            builder = ObjectBuilder(map_type=map_type, duplicate_keys=duplicate_keys)
             path, event, value = (yield)
             if event == 'start_map':
                 object_depth += 1
@@ -231,33 +269,82 @@ def file_source(f, buf_size=64*1024):
             break
 
 
+def _pop_duplicate_keys_config(config):
+    policy = config.pop('duplicate_keys', 'allow')
+    if policy not in DUPLICATE_KEYS_POLICIES:
+        raise ValueError(
+            "Invalid duplicate_keys policy %r; expected one of %r"
+            % (policy, DUPLICATE_KEYS_POLICIES)
+        )
+    budget = config.pop('duplicate_keys_budget', None)
+    return policy, budget
+
+
+def _check_duplicate_keys_support(backend):
+    if not backend['capabilities'].duplicate_keys:
+        raise ValueError(
+            "The %s backend doesn't support the duplicate_keys option"
+            % backend['backend_name']
+        )
+
+
+def _prepare_event_pipeline_duplicate_keys(backend, config):
+    policy, budget = _pop_duplicate_keys_config(config)
+    if policy in OBJECT_ONLY_DUPLICATE_KEYS_POLICIES:
+        raise ValueError(
+            "The duplicate_keys policy %r is only accepted by items/kvitems, "
+            "which construct objects; parse/basic_parse always report all "
+            "events, including duplicated map keys" % (policy,)
+        )
+    if policy == 'allow':
+        return
+    _check_duplicate_keys_support(backend)
+    config['duplicate_keys'] = policy
+    if budget is not None:
+        config['duplicate_keys_budget'] = budget
+
+
 def _basic_parse_pipeline(backend, config):
+    _prepare_event_pipeline_duplicate_keys(backend, config)
     return (
         (backend['basic_parse_basecoro'], [], config),
     )
 
 
 def _parse_pipeline(backend, config):
+    _prepare_event_pipeline_duplicate_keys(backend, config)
     return (
+        (backend['parse_basecoro'], [], {}),
+        (backend['basic_parse_basecoro'], [], config)
+    )
+
+
+def _object_pipeline(backend, basecoro_name, prefix, map_type, config):
+    policy, budget = _pop_duplicate_keys_config(config)
+    builder_kwargs = {'map_type': map_type}
+    if policy != 'allow':
+        _check_duplicate_keys_support(backend)
+        builder_kwargs['duplicate_keys'] = policy
+        if policy == 'error':
+            # Enforced at the parsing layer so that the error is raised
+            # at the second occurrence of the key, before any object
+            # holding it is dispatched
+            config['duplicate_keys'] = 'error'
+            if budget is not None:
+                config['duplicate_keys_budget'] = budget
+    return (
+        (backend[basecoro_name], (prefix,), builder_kwargs),
         (backend['parse_basecoro'], [], {}),
         (backend['basic_parse_basecoro'], [], config)
     )
 
 
 def _items_pipeline(backend, prefix, map_type, config):
-    return (
-        (backend['items_basecoro'], (prefix,), {'map_type': map_type}),
-        (backend['parse_basecoro'], [], {}),
-        (backend['basic_parse_basecoro'], [], config)
-    )
+    return _object_pipeline(backend, 'items_basecoro', prefix, map_type, config)
 
 
 def _kvitems_pipeline(backend, prefix, map_type, config):
-    return (
-        (backend['kvitems_basecoro'], (prefix,), {'map_type': map_type}),
-        (backend['parse_basecoro'], [], {}),
-        (backend['basic_parse_basecoro'], [], config)
-    )
+    return _object_pipeline(backend, 'kvitems_basecoro', prefix, map_type, config)
 
 
 def _make_basic_parse_coro(backend):
@@ -393,6 +480,12 @@ def _make_parse(backend):
                 source, buf_size=buf_size, **config
             )
         elif is_iterable(source):
+            policy, _ = _pop_duplicate_keys_config(config)
+            if policy != 'allow':
+                raise ValueError(
+                    "The duplicate_keys option is not supported when "
+                    "parsing from an iterable of events"
+                )
             return utils.coros2gen(source,
                 (backend['parse_basecoro'], (), {})
             )
@@ -412,8 +505,13 @@ def _make_items(backend):
                 source, prefix, map_type=map_type, buf_size=buf_size, **config
             )
         elif is_iterable(source):
+            policy, _ = _pop_duplicate_keys_config(config)
+            builder_kwargs = {'map_type': map_type}
+            if policy != 'allow':
+                _check_duplicate_keys_support(backend)
+                builder_kwargs['duplicate_keys'] = policy
             return utils.coros2gen(source,
-                (backend['items_basecoro'], (prefix,), {'map_type': map_type})
+                (backend['items_basecoro'], (prefix,), builder_kwargs)
             )
         raise ValueError("Unknown source type: %r" % type(source))
     return items
@@ -431,8 +529,13 @@ def _make_kvitems(backend):
                 source, prefix, map_type=map_type, buf_size=buf_size, **config
             )
         elif is_iterable(source):
+            policy, _ = _pop_duplicate_keys_config(config)
+            builder_kwargs = {'map_type': map_type}
+            if policy != 'allow':
+                _check_duplicate_keys_support(backend)
+                builder_kwargs['duplicate_keys'] = policy
             return utils.coros2gen(source,
-                (backend['kvitems_basecoro'], (prefix,), {'map_type': map_type})
+                (backend['kvitems_basecoro'], (prefix,), builder_kwargs)
             )
         raise ValueError("Unknown source type: %r" % type(source))
     return kvitems
@@ -481,6 +584,7 @@ class BackendCapabilities:
         'invalid_leading_zeros_detection': 'Detection of leading zeros in numbers, marking them as invalid',
         'incomplete_json_tokens_detection': 'Documents with incomplete JSON tokens',
         'int64': '64 bit integers supported when running with ``use_float=True``',
+        'duplicate_keys': 'Control over duplicated keys within JSON objects via the ``duplicate_keys`` option',
     }
 
     def __init__(self):
@@ -489,6 +593,7 @@ class BackendCapabilities:
         self.invalid_leading_zeros_detection = True
         self.incomplete_json_tokens_detection = True
         self.int64 = True
+        self.duplicate_keys = False
 
 
 def enrich_backend(backend, **capabilities_overrides):

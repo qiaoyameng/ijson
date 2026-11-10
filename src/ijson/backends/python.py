@@ -140,11 +140,21 @@ inf = float("inf")
 neg_inf = float("-inf")
 
 @utils.coroutine
-def parse_value(target, multivalue, use_float):
+def parse_value(target, multivalue, use_float, duplicate_keys='allow',
+                duplicate_keys_budget=None):
     """
     Parses results coming out of the Lexer into ijson events, which are sent to
     `target`. A stack keeps track of the type of object being parsed at the time
     (a value, and object or array -- the last two being values themselves).
+
+    When `duplicate_keys` is ``'error'``, a set of already-seen keys is
+    maintained for each object being parsed (nested objects are tracked
+    independently), and a ``common.DuplicateKeyError`` is raised as soon as
+    a key is seen for the second time within the same object. The number of
+    distinct keys tracked per object is limited to `duplicate_keys_budget`
+    (``common.DEFAULT_DUPLICATE_KEYS_BUDGET`` if not given); exceeding the
+    budget raises an explicit error instead of silently stopping the
+    bookkeeping.
 
     A special EOF result coming from the Lexer indicates that no more content is
     expected. This is used to check for incomplete content and raise the
@@ -160,6 +170,10 @@ def parse_value(target, multivalue, use_float):
     send = target.send
     prev_pos, prev_symbol = None, None
     to_number = common.integer_or_float if use_float else common.integer_or_decimal
+    track_keys = duplicate_keys == 'error'
+    if duplicate_keys_budget is None:
+        duplicate_keys_budget = common.DEFAULT_DUPLICATE_KEYS_BUDGET
+    key_sets = []
     while True:
 
         if prev_pos is None:
@@ -214,8 +228,12 @@ def parse_value(target, multivalue, use_float):
                 pos, symbol = (yield)
                 if (pos, symbol) == EOF:
                     raise common.IncompleteJSONError('Incomplete JSON content')
+                if track_keys:
+                    key_sets.append(set())
                 if symbol == '}':
                     send(('end_map', None))
+                    if track_keys:
+                        key_sets.pop()
                     pop()
                 else:
                     prev_pos, prev_symbol = pos, symbol
@@ -253,7 +271,21 @@ def parse_value(target, multivalue, use_float):
         elif state == _PARSE_OBJECT_KEY:
             if symbol[0] != '"':
                 raise UnexpectedSymbol(symbol, pos)
-            send(('map_key', parse_string(symbol)))
+            key = parse_string(symbol)
+            if track_keys:
+                seen_keys = key_sets[-1]
+                if key in seen_keys:
+                    raise common.DuplicateKeyError(
+                        'Duplicate key %r at position %d' % (key, pos)
+                    )
+                if len(seen_keys) >= duplicate_keys_budget:
+                    raise common.JSONError(
+                        'Duplicate key tracking budget of %d distinct keys '
+                        'exceeded by object key %r at position %d'
+                        % (duplicate_keys_budget, key, pos)
+                    )
+                seen_keys.add(key)
+            send(('map_key', key))
             pos, symbol = (yield)
             if (pos, symbol) == EOF:
                 raise common.IncompleteJSONError('Incomplete JSON content')
@@ -269,6 +301,8 @@ def parse_value(target, multivalue, use_float):
                 raise UnexpectedSymbol(symbol, pos)
             else:
                 send(('end_map', None))
+                if track_keys:
+                    key_sets.pop()
                 pop()
                 pop()
 
@@ -289,7 +323,8 @@ def parse_string(symbol):
 
 
 def basic_parse_basecoro(target, multiple_values=False, allow_comments=False,
-                         use_float=False):
+                         use_float=False, duplicate_keys='allow',
+                         duplicate_keys_budget=None):
     '''
     Iterator yielding unprefixed events.
 
@@ -299,7 +334,21 @@ def basic_parse_basecoro(target, multiple_values=False, allow_comments=False,
     '''
     if allow_comments:
         raise ValueError("Comments are not supported by the python backend")
-    return utf8_encoder(Lexer(parse_value(target, multiple_values, use_float)))
+    if duplicate_keys in common.OBJECT_ONLY_DUPLICATE_KEYS_POLICIES:
+        raise ValueError(
+            "The duplicate_keys policy %r is only accepted by items/kvitems, "
+            "which construct objects; parse/basic_parse always report all "
+            "events, including duplicated map keys" % (duplicate_keys,)
+        )
+    if duplicate_keys not in ('allow', 'error'):
+        raise ValueError(
+            "Invalid duplicate_keys policy %r; expected one of %r"
+            % (duplicate_keys, common.DUPLICATE_KEYS_POLICIES)
+        )
+    return utf8_encoder(Lexer(parse_value(
+        target, multiple_values, use_float, duplicate_keys,
+        duplicate_keys_budget
+    )))
 
 
-common.enrich_backend(globals(), c_comments=False)
+common.enrich_backend(globals(), c_comments=False, duplicate_keys=True)

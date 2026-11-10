@@ -2,6 +2,15 @@
 
 ## Development
 
+* Added a `duplicate_keys` option (supported by the `python` backend)
+  with `allow`, `error`, `first` and `last` policies controlling how
+  duplicated keys within a single JSON object are handled.
+  `error` raises the new `ijson.DuplicateKeyError` (including the key's
+  position) at the second occurrence of a key; `first`/`last` keep the
+  first/last value when `items`/`kvitems` construct objects and are
+  rejected by the event-oriented `parse`/`basic_parse` functions.
+  A per-object `duplicate_keys_budget` (default 100000) bounds the
+  key-tracking sets and raises an explicit error when exceeded.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).
