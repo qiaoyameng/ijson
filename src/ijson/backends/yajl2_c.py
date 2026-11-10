@@ -17,6 +17,7 @@ _get_buf_size = lambda kwargs: kwargs.pop('buf_size', 64 * 1024)
 
 @utils.coroutine
 def basic_parse_basecoro(target, **kwargs):
+    common.reject_input_encoding('yajl2_c', kwargs.get('input_encoding'))
     return _yajl2.basic_parse_basecoro(target.send, **kwargs)
 
 def basic_parse_gen(file, **kwargs):

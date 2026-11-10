@@ -34,8 +34,8 @@ def test_from_iter_accepts_string_and_warns(chunks_factory):
     chunks = chunks_factory(['{"key":', '"value"}'])
     file_obj = ijson.from_iter(chunks)
     with pytest.deprecated_call():
-        assert file_obj.read(1) == b'{"key":'
-    assert file_obj.read(1) == b'"value"}'
+        assert file_obj.read(1) == '{"key":'
+    assert file_obj.read(1) == '"value"}'
     assert file_obj.read(1) == b""
 
 
@@ -62,8 +62,8 @@ def test_from_iter_accepts_async_string_chunks_and_warns():
     async def main():
         file_obj = ijson.from_iter(chunks())
         with pytest.deprecated_call():
-            assert await file_obj.read(1) == b'{"key":'
-        assert await file_obj.read(1) == b'"value"}'
+            assert await file_obj.read(1) == '{"key":'
+        assert await file_obj.read(1) == '"value"}'
         assert await file_obj.read(1) == b""
 
     asyncio.run(main())

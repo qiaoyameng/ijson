@@ -4,8 +4,7 @@ Pure-python parsing backend.
 from json.decoder import scanstring
 import re
 
-from ijson import common, utils
-import codecs
+from ijson import common, encodings, utils
 
 
 LEXEME_RE = re.compile(r'[a-z0-9eE\.\+-]+|\S')
@@ -17,41 +16,83 @@ EOF = -1, None
 class UnexpectedSymbol(common.JSONError):
     def __init__(self, symbol, pos):
         super(UnexpectedSymbol, self).__init__(
-            'Unexpected symbol %r at %d' % (symbol, pos)
+            'Unexpected symbol %r at byte %d' % (symbol, pos),
+            pos=pos,
         )
 
 
 @utils.coroutine
-def utf8_encoder(target):
-    decoder = codecs.getincrementaldecoder('utf-8')()
-    decode = decoder.decode
+def input_decoder(target, input_encoding=None):
+    '''
+    Feeds the Lexer with ``(text, offsets)`` pairs where ``offsets[i]`` is the
+    byte position of ``text[i]`` in the original (pre-transcoding) stream.
+
+    Byte streams are transcoded incrementally according to ``input_encoding``
+    (or a leading BOM when it is not given, defaulting to UTF-8). Text
+    streams bypass transcoding entirely: their positions are plain character
+    indices, so no byte encoding is ever applied to ``str`` input.
+    '''
     send = target.send
+    transcoder = None
+    text_mode = False
+    char_pos = 0
+    finished = False
     while True:
         try:
-            final = False
-            bdata = (yield)
+            chunk = (yield)
         except GeneratorExit:
-            final = True
-            bdata = b''
+            chunk = None
+        if finished:
+            return
+        if chunk is not None and not chunk:
+            # An empty read marks end of stream in generator mode; treat it
+            # the same as the coroutine being closed.
+            chunk = None
         try:
-            sdata = decode(bdata, final)
-        except UnicodeDecodeError as e:
+            if chunk is None:
+                finished = True
+                if transcoder is not None:
+                    sdata, offsets = transcoder.finish()
+                    if sdata:
+                        send((sdata, offsets))
+                # Forward the end-of-stream marker so the Lexer emits its EOF
+                # event and parse_value can detect incomplete content. The
+                # call propagates IncompleteJSONError directly; StopIteration
+                # simply means the downstream pipeline finished cleanly.
+                try:
+                    send(('', []))
+                except StopIteration:
+                    return
+                return
+            if isinstance(chunk, str):
+                text_mode = True
+                if input_encoding is not None:
+                    raise common.JSONError(
+                        'input_encoding cannot be used with str input; it only '
+                        'applies to byte streams'
+                    )
+                sdata = chunk
+                offsets = list(range(char_pos, char_pos + len(chunk)))
+                char_pos += len(chunk)
+            else:
+                if text_mode:
+                    raise common.JSONError(
+                        'Cannot mix str and bytes chunks in the same input stream'
+                    )
+                if transcoder is None:
+                    transcoder = encodings.InputTranscoder(input_encoding)
+                sdata, offsets = transcoder.decode(chunk)
+            if sdata:
+                send((sdata, offsets))
+        except BaseException:
+            # Make sure no downstream coroutine is left suspended: otherwise a
+            # later garbage collection would surface its own error (e.g. an
+            # IncompleteJSONError on EOF) as an ignored exception.
             try:
                 target.close()
-            except:
-                pass
-            raise common.IncompleteJSONError(e)
-        except:
-            try:
-                target.close()
-            except:
+            except Exception:
                 pass
             raise
-        if sdata:
-            send(sdata)
-        elif not bdata:
-            target.close()
-            break
 
 @utils.coroutine
 def Lexer(target):
@@ -62,12 +103,19 @@ def Lexer(target):
     content.
     """
     try:
-        data = (yield)
+        data, data_offsets = (yield)
     except GeneratorExit:
-        data = ''
+        data, data_offsets = '', []
+    if not data:
+        # An empty first chunk means the stream is empty. Fall through with an
+        # empty buffer; the main loop below delivers the EOF marker after the
+        # downstream has had a chance to suspend on its first yield.
+        exhausted = True
+    else:
+        exhausted = False
     buf = data
+    buf_offsets = list(data_offsets)
     pos = 0
-    discarded = 0
     send = target.send
     while True:
         match = LEXEME_RE.search(buf, pos)
@@ -88,44 +136,51 @@ def Lexer(target):
                             break
                     except ValueError:
                         try:
-                            data = (yield)
+                            data, data_offsets = (yield)
                         except GeneratorExit:
-                            data = ''
+                            data, data_offsets = '', []
                         if not data:
                             raise common.IncompleteJSONError('Incomplete string lexeme')
                         buf += data
-                send((discarded + pos, buf[pos:end + 1]))
+                        buf_offsets.extend(data_offsets)
+                send((buf_offsets[pos], buf[pos:end + 1]))
                 pos = end + 1
             else:
                 while lexeme not in UNARY_LEXEMES and match.end() == len(buf):
                     try:
-                        data = (yield)
+                        data, data_offsets = (yield)
                     except GeneratorExit:
-                        data = ''
+                        data, data_offsets = '', []
                     if not data:
+                        exhausted = True
                         break
                     buf += data
+                    buf_offsets.extend(data_offsets)
                     match = LEXEME_RE.search(buf, pos)
                     lexeme = match.group()
-                send((discarded + match.start(), lexeme))
+                send((buf_offsets[match.start()], lexeme))
                 pos = match.end()
         else:
-            # Don't ask data from an already exhausted source
-            if data:
+            if not exhausted:
+                # No lexeme found in the remaining buffer: request more data
+                # exactly once, and only treat the stream as exhausted after
+                # the source returns an empty chunk.
                 try:
-                    data = (yield)
+                    data, data_offsets = (yield)
                 except GeneratorExit:
-                    data = ''
-            if not data:
+                    data, data_offsets = '', []
+                if not data:
+                    exhausted = True
+            if exhausted:
                 # Normally should raise StopIteration, but can raise
                 # IncompleteJSONError too, which is the point of sending EOF
                 try:
                     target.send(EOF)
                 except StopIteration:
                     pass
-                break
-            discarded += len(buf)
+                return
             buf = data
+            buf_offsets = list(data_offsets)
             pos = 0
 
 
@@ -178,7 +233,7 @@ def parse_value(target, multivalue, use_float):
                 state = _PARSE_VALUE
                 push(state)
             else:
-                raise common.JSONError('Additional data found')
+                raise common.JSONError('Additional data found', pos=pos)
         assert state_stack
 
         if state == _PARSE_VALUE:
@@ -225,18 +280,18 @@ def parse_value(target, multivalue, use_float):
                 # JSON numbers can't contain leading zeros
                 if ((len(symbol) > 1 and symbol[0] == '0' and symbol[1] not in ('e', 'E', '.')) or
                     (len(symbol) > 2 and symbol[0:2] == '-0' and symbol[2] not in ('e', 'E', '.'))):
-                    raise common.JSONError('Invalid JSON number: %s' % (symbol,))
+                    raise common.JSONError('Invalid JSON number: %s' % (symbol,), pos=pos)
                 # JSON numbers can't start with a plus sign
                 if symbol[0] == '+':
-                    raise common.JSONError(f'Invalid JSON number: {symbol}')
+                    raise common.JSONError(f'Invalid JSON number: {symbol}', pos=pos)
                 # Fractions need a leading digit and must be followed by a digit
                 dot = symbol.find('.')
                 if dot != -1 and not (symbol[dot - 1:dot].isdigit() and symbol[dot + 1:dot + 2].isdigit()):
-                    raise common.JSONError('Invalid JSON number: %s' % (symbol,))
+                    raise common.JSONError('Invalid JSON number: %s' % (symbol,), pos=pos)
                 try:
                     number = to_number(symbol)
                     if number == inf or number == neg_inf:
-                        raise common.JSONError("float overflow: %s" % (symbol,))
+                        raise common.JSONError("float overflow: %s" % (symbol,), pos=pos)
                 except:
                     if 'true'.startswith(symbol) or 'false'.startswith(symbol) or 'null'.startswith(symbol):
                         raise common.IncompleteJSONError('Incomplete JSON content')
@@ -289,17 +344,23 @@ def parse_string(symbol):
 
 
 def basic_parse_basecoro(target, multiple_values=False, allow_comments=False,
-                         use_float=False):
+                         use_float=False, input_encoding=None):
     '''
     Iterator yielding unprefixed events.
 
     Parameters:
 
     - file: a readable file-like object with JSON input
+    - input_encoding: explicit encoding of byte streams; one of utf-8,
+      utf-16-le, utf-16-be, utf-32-le or utf-32-be. When None the encoding
+      is detected from a leading BOM, defaulting to UTF-8.
     '''
     if allow_comments:
         raise ValueError("Comments are not supported by the python backend")
-    return utf8_encoder(Lexer(parse_value(target, multiple_values, use_float)))
+    return input_decoder(
+        Lexer(parse_value(target, multiple_values, use_float)),
+        input_encoding=input_encoding,
+    )
 
 
 common.enrich_backend(globals(), c_comments=False)

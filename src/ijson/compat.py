@@ -20,12 +20,11 @@ ijson works by reading bytes, but a string reader has been given instead. This
 probably, but not necessarily, means a file-like object has been opened in text
 mode ('t') rather than binary mode ('b').
 
-An automatic conversion is being performed on the fly to continue, but on the
-other hand this creates unnecessary encoding/decoding operations that decrease
-the efficiency of the system. In the future this automatic conversion will be
-removed, and users will receive errors instead of this warning. To avoid this
-problem make sure file-like objects are opened in binary mode instead of text
-mode.
+The python backend now consumes text input directly without re-encoding it to
+UTF-8, but other backends still perform an on-the-fly UTF-8 conversion that
+decreases efficiency. In the future this automatic conversion will be removed,
+and users will receive errors instead of this warning. To avoid this problem
+make sure file-like objects are opened in binary mode instead of text mode.
 '''
 
 def _warn_and_return(o):

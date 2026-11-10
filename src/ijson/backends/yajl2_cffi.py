@@ -220,6 +220,7 @@ def basic_parse_basecoro(target, **config):
     - allow_comments: tells parser to allow comments in JSON input
     - multiple_values: allows the parser to parse multiple JSON objects
     '''
+    common.reject_input_encoding('yajl2_cffi', config.get('input_encoding'))
 
     # the scope objects makes sure the C objects allocated in _yajl.init
     # are kept alive until this function is done

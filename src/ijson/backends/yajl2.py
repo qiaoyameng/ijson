@@ -17,7 +17,7 @@ YAJL_MULTIPLE_VALUES = 8
 
 @utils.coroutine
 def basic_parse_basecoro(target, allow_comments=False, multiple_values=False,
-                         use_float=False):
+                         use_float=False, input_encoding=None):
     '''
     Iterator yielding unprefixed events.
 
@@ -28,6 +28,7 @@ def basic_parse_basecoro(target, allow_comments=False, multiple_values=False,
     - buf_size: a size of an input buffer
     - multiple_values: allows the parser to parse multiple JSON objects
     '''
+    common.reject_input_encoding('yajl2', input_encoding)
     callbacks, _keepalive, pending = _yajl2_ctypes_common.make_callbaks(target.send, use_float, 2)
     handle = yajl.yajl_alloc(byref(callbacks), None, None)
     if allow_comments:

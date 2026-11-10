@@ -407,6 +407,28 @@ to give users more fine-grained control over certain operations:
   controls whether C-style comments (e.g., ``/* a comment */``),
   which are not supported by the JSON standard,
   are allowed in the content or not.
+- The ``input_encoding`` option (only available on the ``python`` backend)
+  names the encoding of a byte stream.
+  Accepted values are ``utf-8``, ``utf-16-le``, ``utf-16-be``,
+  ``utf-32-le`` and ``utf-32-be``.
+  When omitted, the encoding is detected solely from a leading
+  `byte order mark (BOM) <https://en.wikipedia.org/wiki/Byte_order_mark>`_;
+  a stream without a BOM is treated as UTF-8,
+  matching ijson's historical behavior.
+  No heuristic or probabilistic charset detection is performed,
+  and a BOM that contradicts an explicitly given ``input_encoding``
+  raises an error.
+  Transcoding is fully incremental,
+  so code units and UTF-16 surrogate pairs split across input chunks
+  are reassembled correctly;
+  lone surrogates, truncated code units and other malformed sequences
+  are reported as errors.
+  Errors raised while parsing carry the offending position as a byte
+  offset into the *original* input (``JSONError.pos``)
+  together with a locatable event path (``JSONError.prefix``)
+  on the prefixed ``parse``/``items``/``kvitems`` entry points.
+  This option cannot be combined with ``str`` input,
+  which is consumed directly as text.
 - For functions taking a file-like object,
   an additional ``buf_size`` option (defaults to ``65536`` or 64KB)
   specifies the amount of bytes the library

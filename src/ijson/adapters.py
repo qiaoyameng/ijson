@@ -24,7 +24,7 @@ def _to_bytes(chunk, warned: bool):
         if not warned:
             compat._warn_and_return(None)
             warned = True
-        return chunk.encode("utf-8"), warned
+        return chunk, warned
     raise TypeError("from_iter expects an iterable of bytes or str")
 
 

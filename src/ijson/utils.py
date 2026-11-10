@@ -42,10 +42,13 @@ class sendable_list(list):
     send = list.append
 
 
-def coros2gen(source, *coro_pipeline):
+def coros2gen(source, *coro_pipeline, path_state=None):
     '''
     A utility function that returns a generator yielding values dispatched by a
     coroutine pipeline after *it* has received values coming from `source`.
+
+    When ``path_state`` is given, any :class:`ijson.JSONError` raised by the
+    pipeline is annotated with its current prefix before being re-raised.
     '''
     events = sendable_list()
     f = chain(events, *coro_pipeline)
@@ -58,6 +61,10 @@ def coros2gen(source, *coro_pipeline):
                     yield event
                 if isinstance(ex, StopIteration):
                     return
+                if path_state is not None and isinstance(ex, Exception):
+                    from ijson import common
+                    if isinstance(ex, common.JSONError):
+                        ex.with_location(prefix=path_state.prefix)
                 raise
             for event in events:
                 yield event

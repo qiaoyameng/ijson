@@ -13,7 +13,22 @@ class JSONError(Exception):
     '''
     Base exception for all parsing errors.
     '''
-    pass
+    def __init__(self, *args, pos=None, prefix=None):
+        super().__init__(*args)
+        # Byte position in the original (pre-transcoding) input stream where
+        # the offending content starts. None when not applicable.
+        self.pos = pos
+        # Event prefix locating the container being parsed when the error was
+        # raised, e.g. 'docs.item'. Empty string means the document root.
+        self.prefix = prefix
+
+    def with_location(self, pos=None, prefix=None):
+        '''Returns the exception, filling in any missing location info.'''
+        if self.pos is None and pos is not None:
+            self.pos = pos
+        if self.prefix is None and prefix is not None:
+            self.prefix = prefix
+        return self
 
 
 class IncompleteJSONError(JSONError):
@@ -69,6 +84,7 @@ def parse_basecoro(target):
 
     '''
     path = []
+    prefix = ''
     while True:
         event, value = yield
         if event == 'map_key':
@@ -89,6 +105,71 @@ def parse_basecoro(target):
         else: # any scalar value
             prefix = '.'.join(path)
         target.send((prefix, event, value))
+
+
+class _PathState:
+    '''
+    Tracks the JSON container path so errors raised while expecting the next
+    event can still be located. ``prefix`` holds the prefix that the next
+    value or container would carry.
+    '''
+    __slots__ = ('path', 'prefix')
+
+    def __init__(self):
+        self.path = []
+        self.prefix = ''
+
+
+@utils.coroutine
+def path_tracker_coro(target, state):
+    '''
+    Outermost coroutine of a prefixed pipeline (parse/items/kvitems). It only
+    records the prefix of every event flowing through so that an error raised
+    deeper in the lexer can be annotated with the container being parsed at
+    the time, even when the offending input produces no event itself.
+    '''
+    while True:
+        item = (yield)
+        # Only prefixed parse events (3-tuples) describe the document path;
+        # everything else is forwarded untouched, so this coroutine can sit at
+        # any point of an items/kvitems pipeline.
+        if isinstance(item, tuple) and len(item) == 3:
+            prefix, event, value = item
+            # Mirror parse_basecoro's path bookkeeping so the location of a
+            # missing/invalid next token can be derived even when no event for
+            # it is ever produced.
+            if event == 'map_key':
+                state.path[-1] = value
+            elif event == 'start_map':
+                state.path.append(None)
+            elif event == 'end_map':
+                state.path.pop()
+            elif event == 'start_array':
+                state.path.append('item')
+            elif event == 'end_array':
+                state.path.pop()
+            state.prefix = '.'.join(
+                part for part in state.path if part is not None
+            )
+        target.send(item)
+
+
+@utils.coroutine
+def path_error_coro(target, state):
+    '''
+    Push-mode counterpart of the ``path_state`` handling used by generators.
+    It forwards raw chunks into the wrapped pipeline (built by the caller)
+    via ``target`` and annotates any JSONError with the latest event prefix.
+    The wrapped pipeline's first stage is expected to be a
+    :func:`path_tracker_coro` updating ``state``.
+    '''
+    while True:
+        chunk = (yield)
+        try:
+            target.send(chunk)
+        except JSONError as ex:
+            ex.with_location(prefix=state.prefix)
+            raise
 
 
 class ObjectBuilder:
@@ -223,7 +304,10 @@ def number(str_value):
 
 def file_source(f, buf_size=64*1024):
     '''A generator that yields data from a file-like object'''
-    f = compat.bytes_reader(f)
+    if type(f.read(0)) != bytes:
+        # Text readers are supported directly by the python backend without
+        # re-encoding to UTF-8; keep the historical deprecation warning.
+        compat._warn_and_return(None)
     while True:
         data = f.read(buf_size)
         yield data
@@ -271,28 +355,37 @@ def _make_basic_parse_coro(backend):
 
 def _make_parse_coro(backend):
     def parse_coro(target, **config):
-        return utils.chain(
+        state = _PathState()
+        pipeline = utils.chain(
             target,
+            (path_tracker_coro, (state,), {}),
             *_parse_pipeline(backend, config)
         )
+        return path_error_coro(pipeline, state)
     return parse_coro
 
 
 def _make_items_coro(backend):
     def items_coro(target, prefix, map_type=None, **config):
-        return utils.chain(
+        state = _PathState()
+        pipeline = utils.chain(
             target,
+            (path_tracker_coro, (state,), {}),
             *_items_pipeline(backend, prefix, map_type, config)
         )
+        return path_error_coro(pipeline, state)
     return items_coro
 
 
 def _make_kvitems_coro(backend):
     def kvitems_coro(target, prefix, map_type=None, **config):
-        return utils.chain(
+        state = _PathState()
+        pipeline = utils.chain(
             target,
+            (path_tracker_coro, (state,), {}),
             *_kvitems_pipeline(backend, prefix, map_type, config)
         )
+        return path_error_coro(pipeline, state)
     return kvitems_coro
 
 
@@ -341,27 +434,36 @@ def _make_basic_parse_gen(backend):
 
 def _make_parse_gen(backend):
     def parse_gen(file_obj, buf_size=64*1024, **config):
+        state = _PathState()
         return utils.coros2gen(
             file_source(file_obj, buf_size=buf_size),
-            *_parse_pipeline(backend, config)
+            (path_tracker_coro, (state,), {}),
+            *_parse_pipeline(backend, config),
+            path_state=state,
         )
     return parse_gen
 
 
 def _make_items_gen(backend):
     def items_gen(file_obj, prefix, map_type=None, buf_size=64*1024, **config):
+        state = _PathState()
         return utils.coros2gen(
             file_source(file_obj, buf_size=buf_size),
-            *_items_pipeline(backend, prefix, map_type, config)
+            (path_tracker_coro, (state,), {}),
+            *_items_pipeline(backend, prefix, map_type, config),
+            path_state=state,
         )
     return items_gen
 
 
 def _make_kvitems_gen(backend):
     def kvitems_gen(file_obj, prefix, map_type=None, buf_size=64*1024, **config):
+        state = _PathState()
         return utils.coros2gen(
             file_source(file_obj, buf_size=buf_size),
-            *_kvitems_pipeline(backend, prefix, map_type, config)
+            (path_tracker_coro, (state,), {}),
+            *_kvitems_pipeline(backend, prefix, map_type, config),
+            path_state=state,
         )
     return kvitems_gen
 
@@ -394,7 +496,7 @@ def _make_parse(backend):
             )
         elif is_iterable(source):
             return utils.coros2gen(source,
-                (backend['parse_basecoro'], (), {})
+                (backend['parse_basecoro'], (), {}),
             )
         raise ValueError("Unknown source type: %r" % type(source))
     return parse
@@ -413,7 +515,7 @@ def _make_items(backend):
             )
         elif is_iterable(source):
             return utils.coros2gen(source,
-                (backend['items_basecoro'], (prefix,), {'map_type': map_type})
+                (backend['items_basecoro'], (prefix,), {'map_type': map_type}),
             )
         raise ValueError("Unknown source type: %r" % type(source))
     return items
@@ -432,7 +534,7 @@ def _make_kvitems(backend):
             )
         elif is_iterable(source):
             return utils.coros2gen(source,
-                (backend['kvitems_basecoro'], (prefix,), {'map_type': map_type})
+                (backend['kvitems_basecoro'], (prefix,), {'map_type': map_type}),
             )
         raise ValueError("Unknown source type: %r" % type(source))
     return kvitems
@@ -489,6 +591,15 @@ class BackendCapabilities:
         self.invalid_leading_zeros_detection = True
         self.incomplete_json_tokens_detection = True
         self.int64 = True
+
+
+def reject_input_encoding(backend_name, input_encoding=None):
+    '''Shared guard for backends that do not support ``input_encoding``.'''
+    if input_encoding is not None:
+        raise ValueError(
+            'input_encoding is only supported by the python backend; the %s '
+            'backend does not support it' % backend_name
+        )
 
 
 def enrich_backend(backend, **capabilities_overrides):

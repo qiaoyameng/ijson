@@ -2,6 +2,17 @@
 
 ## Development
 
+* The `python` backend accepts a new `input_encoding` option for byte streams,
+  with explicit support for `utf-8`, `utf-16-le`, `utf-16-be`, `utf-32-le`
+  and `utf-32-be`. When the option is not given the encoding is detected only
+  from a leading BOM and everything else is treated as UTF-8; no heuristic
+  charset detection is used. Transcoding is incremental (cross-chunk code
+  units and UTF-16 surrogate pairs are preserved), and BOM/declaration
+  conflicts, lone surrogates and truncated code units raise an error. The
+  other backends explicitly reject the option. Parsing errors now expose the
+  original input's byte offset (`JSONError.pos`) and a locatable event path
+  (`JSONError.prefix`) on `parse`/`items`/`kvitems`. Text (`str`) input is
+  consumed directly and cannot be combined with `input_encoding`.
 * Fixed handling of integers longer than `sys.get_int_max_str_digits()`:
   the `yajl2_c` backend no longer crashes on them, and all backends
   now raise the `ValueError` produced by `int()` (#188).

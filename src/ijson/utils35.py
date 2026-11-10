@@ -19,7 +19,10 @@ async def _get_read(f):
     """Returns an awaitable read function that reads the requested type"""
     if type(await f.read(0)) == bytes:
         return f.read
-    return compat._warn_and_return(utf8reader_async(f).read)
+    # Text readers are consumed directly by the python backend instead of
+    # being re-encoded to UTF-8; keep the historical deprecation warning.
+    compat._warn_and_return(None)
+    return f.read
 
 class sendable_deque(collections.deque):
     '''Like utils.sendable_list, but for deque objects'''
@@ -32,13 +35,14 @@ class async_iterable:
     from an async file-like object.
     '''
 
-    def __init__(self, f, buf_size, *coro_pipeline):
+    def __init__(self, f, buf_size, *coro_pipeline, path_state=None):
         self.events = sendable_deque()
         self.coro = utils.chain(self.events, *coro_pipeline)
         self.coro_finished = False
         self.f = f
         self.buf_size = buf_size
         self.read = None
+        self.path_state = path_state
 
     def __aiter__(self):
         return self
@@ -56,6 +60,10 @@ class async_iterable:
                 self.coro.send(data)
                 if self.events:
                     return self.events.popleft()
+            except common.JSONError as ex:
+                if self.path_state is not None:
+                    ex.with_location(prefix=self.path_state.prefix)
+                raise
             except StopIteration:
                 self.coro_finished = True
                 if self.events:
@@ -72,21 +80,30 @@ def _make_basic_parse_async(backend):
 
 def _make_parse_async(backend):
     def parse_async(f, buf_size=64*1024, **config):
+        state = common._PathState()
         return async_iterable(f, buf_size,
-            *common._parse_pipeline(backend, config)
+            (common.path_tracker_coro, (state,), {}),
+            *common._parse_pipeline(backend, config),
+            path_state=state,
         )
     return parse_async
 
 def _make_items_async(backend):
     def items_async(f, prefix, map_type=None, buf_size=64*1024, **config):
+        state = common._PathState()
         return async_iterable(f, buf_size,
-            *common._items_pipeline(backend, prefix, map_type, config)
+            (common.path_tracker_coro, (state,), {}),
+            *common._items_pipeline(backend, prefix, map_type, config),
+            path_state=state,
         )
     return items_async
 
 def _make_kvitems_async(backend):
     def kvitems_async(f, prefix, map_type=None, buf_size=64*1024, **config):
+        state = common._PathState()
         return async_iterable(f, buf_size,
-            *common._kvitems_pipeline(backend, prefix, map_type, config)
+            (common.path_tracker_coro, (state,), {}),
+            *common._kvitems_pipeline(backend, prefix, map_type, config),
+            path_state=state,
         )
     return kvitems_async
